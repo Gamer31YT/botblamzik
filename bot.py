@@ -1,6 +1,6 @@
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -19,7 +19,7 @@ logging.basicConfig(
 
 # Токен бота
 BOT_TOKEN = "8504090327:AAEWPolM5Kb1uRbvJB7dWphbD9nYVzZJc9Q"
-ADMINS = [8268613975]  # ЗАМЕНИТЕ НА СВОЙ ID
+ADMINS = [5171361978,8268613975,2143824530]  # ЗАМЕНИТЕ НА СВОЙ ID
 
 # Инициализация
 bot = Bot(token=BOT_TOKEN)
@@ -38,35 +38,61 @@ MSG_ACCESS_DENIED = "❌ Доступ запрещён."
 MSG_ONLY_IN_PRIVATE_ALERT = "❌ Команда доступна только в личных сообщениях."
 MSG_ACCESS_DENIED_ALERT = "❌ Доступ запрещён."
 
-# Создание/обновление таблиц
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        balance INTEGER DEFAULT 0
-    )
-''')
+# === ФУНКЦИЯ ОБНОВЛЕНИЯ СХЕМЫ БД ===
+def ensure_schema():
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance INTEGER DEFAULT 0
+        )
+    ''')
 
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        reason TEXT,
-        media_id TEXT DEFAULT NULL,
-        status TEXT DEFAULT 'pending',
-        admin_id INTEGER DEFAULT NULL
-    )
-''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            reason TEXT,
+            media_id TEXT DEFAULT NULL,
+            media_type TEXT DEFAULT NULL,
+            status TEXT DEFAULT 'pending',
+            admin_id INTEGER DEFAULT NULL
+        )
+    ''')
 
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS shop (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        price INTEGER
-    )
-''')
-conn.commit()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS shop (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            price INTEGER
+        )
+    ''')
+
+    # === НОВАЯ ТАБЛИЦА: история переводов ===
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER,
+            receiver_id INTEGER,
+            amount INTEGER,
+            date TEXT
+        )
+    ''')
+
+    # Проверяем, существуют ли столбцы
+    cursor.execute("PRAGMA table_info(requests)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'media_type' not in columns:
+        cursor.execute("ALTER TABLE requests ADD COLUMN media_type TEXT DEFAULT NULL")
+        print("✅ Столбец media_type добавлен в таблицу requests")
+    if 'media_id' not in columns:
+        cursor.execute("ALTER TABLE requests ADD COLUMN media_id TEXT DEFAULT NULL")
+        print("✅ Столбец media_id добавлен в таблицу requests")
+
+    conn.commit()
+
+ensure_schema()
 
 def get_user_balance(user_id):
     cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
@@ -84,12 +110,12 @@ def update_balance(user_id, amount, username="unknown"):
     conn.commit()
     logging.info(f"ADJUST | User: {user_id} (@{username}) | Amount: {amount} | New: {get_user_balance(user_id)}")
 
-def add_request(user_id, username, reason, media_id=None):
-    cursor.execute("INSERT INTO requests (user_id, username, reason, media_id) VALUES (?, ?, ?, ?)", (user_id, username, reason, media_id))
+def add_request(user_id, username, reason, media_id=None, media_type=None):
+    cursor.execute("INSERT INTO requests (user_id, username, reason, media_id, media_type) VALUES (?, ?, ?, ?, ?)", (user_id, username, reason, media_id, media_type))
     conn.commit()
 
 def get_pending_requests():
-    cursor.execute("SELECT id, user_id, username, reason, media_id FROM requests WHERE status = 'pending'")
+    cursor.execute("SELECT id, user_id, username, reason, media_id, media_type FROM requests WHERE status = 'pending'")
     return cursor.fetchall()
 
 def get_request_history(limit=20):
@@ -144,6 +170,23 @@ def is_group_chat(message: Message) -> bool:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
+# === НОВАЯ ФУНКЦИЯ: проверка лимита переводов в день ===
+def get_transfer_count_today(sender_id, receiver_id):
+    today = date.today().isoformat()
+    cursor.execute(
+        "SELECT COUNT(*) FROM transfers WHERE sender_id = ? AND receiver_id = ? AND date = ?",
+        (sender_id, receiver_id, today)
+    )
+    return cursor.fetchone()[0]
+
+def add_transfer(sender_id, receiver_id, amount):
+    today = date.today().isoformat()
+    cursor.execute(
+        "INSERT INTO transfers (sender_id, receiver_id, amount, date) VALUES (?, ?, ?, ?)",
+        (sender_id, receiver_id, amount, today)
+    )
+    conn.commit()
+
 # Назад в главное меню
 def back_to_main():
     return types.InlineKeyboardMarkup(inline_keyboard=[
@@ -170,6 +213,12 @@ async def cmd_apply(message: Message):
     if not is_group_chat(message):
         await message.answer(MSG_ONLY_IN_GROUP)
         return
+
+    # Проверяем, есть ли текст в сообщении
+    if not message.text:
+        await message.answer("❌ Используйте: /apply_blyamzic Причина получения")
+        return
+
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer("Используйте: /apply_blyamzic Причина получения")
@@ -178,20 +227,77 @@ async def cmd_apply(message: Message):
 
     # Проверяем, есть ли медиа
     media_id = None
+    media_type = None
+
     if message.photo:
         media_id = message.photo[-1].file_id
+        media_type = "photo"
     elif message.video:
         media_id = message.video.file_id
+        media_type = "video"
     elif message.document:
         media_id = message.document.file_id
+        media_type = "document"
     elif message.voice:
         media_id = message.voice.file_id
+        media_type = "voice"
     elif message.audio:
         media_id = message.audio.file_id
+        media_type = "audio"
     elif message.video_note:
         media_id = message.video_note.file_id
+        media_type = "video_note"
 
-    add_request(message.from_user.id, message.from_user.username or "unknown", reason, media_id)
+    add_request(message.from_user.id, message.from_user.username or "unknown", reason, media_id, media_type)
+    await message.answer("Ваша заявка отправлена на проверку администратору.")
+
+# === НОВАЯ ФУНКЦИЯ: обработка фото/видео с описанием ===
+@dp.message(F.photo | F.video | F.document | F.voice | F.audio | F.video_note)
+async def handle_media_with_caption(message: Message):
+    if not is_group_chat(message):
+        return
+
+    # Проверяем, есть ли описание (caption)
+    if not message.caption:
+        await message.answer("❌ Отправьте фото/видео с описанием, содержащим команду: /apply_blyamzic Причина получения")
+        return
+
+    # Проверяем, начинается ли описание с команды
+    if not message.caption.startswith("/apply_blyamzic"):
+        await message.answer("❌ Чтобы отправить заявку, начните описание с команды: /apply_blyamzic Причина получения")
+        return
+
+    # Извлекаем причину из описания
+    args = message.caption.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Используйте: /apply_blyamzic Причина получения")
+        return
+    reason = args[1]
+
+    # Получаем тип и ID медиа
+    media_id = None
+    media_type = None
+
+    if message.photo:
+        media_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.video:
+        media_id = message.video.file_id
+        media_type = "video"
+    elif message.document:
+        media_id = message.document.file_id
+        media_type = "document"
+    elif message.voice:
+        media_id = message.voice.file_id
+        media_type = "voice"
+    elif message.audio:
+        media_id = message.audio.file_id
+        media_type = "audio"
+    elif message.video_note:
+        media_id = message.video_note.file_id
+        media_type = "video_note"
+
+    add_request(message.from_user.id, message.from_user.username or "unknown", reason, media_id, media_type)
     await message.answer("Ваша заявка отправлена на проверку администратору.")
 
 @dp.message(Command("shop"))
@@ -206,7 +312,7 @@ async def cmd_shop(message: Message):
     text = "🛍 Магазин блямзиков:\n\n"
     for item in items:
         text += f"{item[0]}. {item[1]} — {item[2]} блямзиков\n"  # ✅ Исправлено: было item[0}]
-    text += "\nЧтобы купить, введите номер товара (ID)."
+    text += "\nЧтобы купить, введите номер товара."
     await message.answer(text)
 
 # === Обработка ввода номера товара для покупки ===
@@ -234,6 +340,76 @@ async def cmd_top(message: Message):
     for i, user in enumerate(top_users, start=1):
         text += f"{i}. @{user[1] or 'unknown'} — {user[2]} блямзиков\n"
     await message.answer(text)
+
+# === НОВАЯ ФУНКЦИЯ: перевод блямзиков ===
+@dp.message(Command("transfer"))
+async def cmd_transfer(message: Message):
+    if not is_group_chat(message):
+        await message.answer(MSG_ONLY_IN_GROUP)
+        return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Используйте: /transfer @username количество")
+        return
+
+    target_username = args[1]
+    try:
+        amount = int(args[2])
+    except ValueError:
+        await message.answer("Количество должно быть числом.")
+        return
+
+    if amount <= 0:
+        await message.answer("Переводить можно только положительное количество.")
+        return
+
+    sender_id = message.from_user.id
+    sender_balance = get_user_balance(sender_id)
+
+    if sender_balance < amount:
+        await message.answer("❌ Недостаточно блямзиков для перевода.")
+        return
+
+    # === ПРОВЕРКА ЛИМИТА: 3 перевода в день ===
+    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username[1:],))
+    receiver = cursor.fetchone()
+
+    if not receiver:
+        await message.answer(f"❌ Пользователь {target_username} не найден. Убедитесь, что он уже писал боту.")
+        return
+
+    receiver_id, = receiver
+
+    if receiver_id == sender_id:
+        await message.answer("❌ Нельзя перевести самому себе.")
+        return
+
+    # Проверяем лимит
+    count_today = get_transfer_count_today(sender_id, receiver_id)
+    if count_today >= 3:
+        await message.answer("❌ Вы уже перевели 3 раза этому пользователю сегодня.")
+        return
+
+    # Выполняем перевод
+    update_balance(sender_id, -amount, message.from_user.username)
+    update_balance(receiver_id, amount, target_username[1:])
+
+    # === СОХРАНЯЕМ ПЕРЕВОД В ИСТОРИЮ ===
+    add_transfer(sender_id, receiver_id, amount)
+
+    # Уведомляем обоих
+    try:
+        await bot.send_message(sender_id, f"✅ Вы перевели {amount} блямзиков пользователю {target_username}.")
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(receiver_id, f"💰 Вам перевели {amount} блямзиков от @{message.from_user.username}!")
+    except Exception:
+        pass
+
+    await message.answer(f"✅ Перевод выполнен: @{message.from_user.username} → {target_username}: {amount} блямзиков.")
 
 # === АДМИН-КОМАНДЫ (работают только в ЛС) ===
 
@@ -312,6 +488,14 @@ async def cmd_profile(message: Message):
             await message.answer("Пользователь не найден.")
             return
         username = user[0]
+
+        # === КНОПКА "ПЕРЕВЕСТИ" ===
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="💰 Перевести", callback_data=f"transfer_to_{user_id}")],
+            [types.InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_user_{user_id}")],
+            [types.InlineKeyboardButton(text=BACK_BUTTON, callback_data="back_to_main")]
+        ])
+
         cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ?", (user_id,))
         total_requests = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ? AND status = 'approved'", (user_id,))
@@ -320,10 +504,25 @@ async def cmd_profile(message: Message):
             f"👤 Профиль @{username} (ID: {user_id})\n"
             f"💰 Баланс: {balance} блямзиков\n"
             f"📊 Заявок всего: {total_requests}\n"
-            f"✅ Одобрено: {approved}"
+            f"✅ Одобрено: {approved}",
+            reply_markup=keyboard
         )
     except ValueError:
         await message.answer("Неверный ID.")
+
+# === КНОПКА "ПЕРЕВЕСТИ" В ПРОФИЛЕ ===
+@dp.callback_query(F.data.startswith("transfer_to_"))
+async def transfer_to_user(call: CallbackQuery):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+
+    target_user_id = int(call.data.split("_")[2])
+    await call.message.edit_text(f"Введите сумму для перевода пользователю с ID {target_user_id}:\n\nПример: /adjust {target_user_id} 50")
+    await call.answer()
 
 # === АДМИН-ПАНЕЛЬ (все callback-функции тоже проверяют админа и ЛС) ===
 
@@ -373,42 +572,31 @@ async def admin_requests(call: CallbackQuery):
 
 # === Отправка медиа админу при одобрении/отклонении ===
 
-async def send_media_to_admin(req_id, user_id, reason, media_id, admin_id, action):
+async def send_media_to_admin(req_id, user_id, reason, media_id, media_type, admin_id, action):
     try:
         # Получаем юзернейм
         user = await bot.get_chat(user_id)
         username = user.username or "unknown"
 
-        # Если есть медиа, отправляем его
-        if media_id:
-            await send_media_by_type(media_id, admin_id, req_id, username, reason, action)
+        caption = f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}"
+
+        if media_id and media_type:
+            if media_type == "photo":
+                await bot.send_photo(chat_id=admin_id, photo=media_id, caption=caption)
+            elif media_type == "video":
+                await bot.send_video(chat_id=admin_id, video=media_id, caption=caption)
+            elif media_type == "document":
+                await bot.send_document(chat_id=admin_id, document=media_id, caption=caption)
+            elif media_type == "voice":
+                await bot.send_voice(chat_id=admin_id, voice=media_id, caption=caption)
+            elif media_type == "audio":
+                await bot.send_audio(chat_id=admin_id, audio=media_id, caption=caption)
+            elif media_type == "video_note":
+                await bot.send_video_note(chat_id=admin_id, video_note=media_id)
         else:
             await bot.send_message(chat_id=admin_id, text=f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}")
     except Exception as e:
         logging.error(f"Ошибка при отправке медиа админу {admin_id}: {e}")
-
-async def send_media_by_type(media_id, admin_id, req_id, username, reason, action):
-    caption = f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}"
-    # Список типов медиа и соответствующих методов
-    media_types = [
-        ("photo", "send_photo"),
-        ("video", "send_video"),
-        ("document", "send_document"),
-        ("voice", "send_voice"),
-        ("audio", "send_audio"),
-        ("video_note", "send_video_note"),
-    ]
-
-    for media_type, method_name in media_types:
-        try:
-            method = getattr(bot, method_name)
-            await method(chat_id=admin_id, **{media_type: media_id}, caption=caption)
-            return
-        except Exception:
-            continue
-
-    # Если не получилось — просто текст
-    await bot.send_message(chat_id=admin_id, text=f"Заявка #{req_id} от @{username}\nПричина: {reason}\nДействие: {action}")
 
 async def get_user_id_by_req_id(req_id):
     cursor.execute(SQL_GET_USER_ID_BY_REQ_ID, (req_id,))
@@ -424,12 +612,12 @@ async def approve_request(call: CallbackQuery):
         await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
     req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id FROM requests WHERE id = ?", (req_id,))
+    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
     row = cursor.fetchone()
     if not row:
         await call.answer("Заявка не найдена.", show_alert=True)
         return
-    user_id, reason, media_id = row
+    user_id, reason, media_id, media_type = row
 
     update_request_status(req_id, 'approved', call.from_user.id)
 
@@ -438,7 +626,7 @@ async def approve_request(call: CallbackQuery):
     except Exception:
         pass
 
-    await send_media_to_admin(req_id, user_id, reason, media_id, call.from_user.id, "✅ Одобрено")
+    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "✅ Одобрено")
     await admin_requests(call)
 
 @dp.callback_query(F.data.startswith("decline_"))
@@ -450,12 +638,12 @@ async def decline_request(call: CallbackQuery):
         await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
         return
     req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id FROM requests WHERE id = ?", (req_id,))
+    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
     row = cursor.fetchone()
     if not row:
         await call.answer("Заявка не найдена.", show_alert=True)
         return
-    user_id, reason, media_id = row
+    user_id, reason, media_id, media_type = row
 
     update_request_status(req_id, 'declined', call.from_user.id)
 
@@ -464,7 +652,7 @@ async def decline_request(call: CallbackQuery):
     except Exception:
         pass
 
-    await send_media_to_admin(req_id, user_id, reason, media_id, call.from_user.id, "❌ Отклонено")
+    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "❌ Отклонено")
     await admin_requests(call)
 
 @dp.callback_query(F.data == "admin_shop")
