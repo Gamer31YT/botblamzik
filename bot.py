@@ -765,8 +765,20 @@ async def process_promocode(message: Message, state: FSMContext):
     await state.clear()
 
 # === КОМАНДА ДЛЯ СОЗДАНИЯ ПРОМОКОДОВ (только для админов) ===
-@router.message(Command(["create_promocode", "cp"]))
-async def cmd_create_promocode(message: Message, state: FSMContext):
+@router.message(Command("create_promocode"))
+async def cmd_create_promocode_full(message: Message, state: FSMContext):
+    if not is_private_chat(message):
+        await message.answer(MSG_ONLY_IN_PRIVATE)
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer(MSG_ACCESS_DENIED)
+        return
+    
+    await message.answer("Введите награду за промокод (в восьмерятах):")
+    await state.set_state(AdminPromocodeStates.create_reward)
+
+@router.message(Command("cp"))
+async def cmd_create_promocode_short(message: Message, state: FSMContext):
     if not is_private_chat(message):
         await message.answer(MSG_ONLY_IN_PRIVATE)
         return
