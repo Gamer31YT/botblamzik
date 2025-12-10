@@ -11,6 +11,7 @@ import asyncio
 from typing import Optional
 import re
 import random
+import string
 
 # === НАСТРОЙКА ЛОГИРОВАНИЯ ===
 logging.basicConfig(
@@ -141,6 +142,28 @@ def ensure_schema():
             message TEXT,
             date TEXT DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'pending'
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promocodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE,
+            reward INTEGER,
+            uses_limit INTEGER,
+            uses_count INTEGER DEFAULT 0,
+            creator_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT DEFAULT NULL
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promocode_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            promocode_id INTEGER,
+            user_id INTEGER,
+            used_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
 
@@ -298,6 +321,62 @@ def get_pending_feedback():
     cursor.execute("SELECT id, user_id, type, message FROM feedback WHERE status = 'pending'")
     return cursor.fetchall()
 
+# === ФУНКЦИИ ДЛЯ ПРОМОКОДОВ ===
+def generate_promocode(length=8):
+    chars = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def create_promocode(reward, uses_limit, expires_at=None):
+    code = generate_promocode()
+    cursor.execute(
+        "INSERT INTO promocodes (code, reward, uses_limit, creator_id) VALUES (?, ?, ?, ?)",
+        (code, reward, uses_limit, 0)  # creator_id временно 0, будет обновлён в вызывающем коде
+    )
+    conn.commit()
+    return code
+
+def get_promocode_by_code(code):
+    cursor.execute("SELECT * FROM promocodes WHERE code = ?", (code,))
+    return cursor.fetchone()
+
+def use_promocode(code, user_id):
+    promocode = get_promocode_by_code(code)
+    if not promocode:
+        return False, "Промокод не найден"
+    
+    promocode_id, code, reward, uses_limit, uses_count, creator_id, created_at, expires_at = promocode
+    
+    if expires_at and datetime.now() > datetime.fromisoformat(expires_at):
+        return False, "Срок действия промокода истёк"
+    
+    if uses_count >= uses_limit:
+        return False, "Лимит использований промокода исчерпан"
+    
+    # Проверяем, использовал ли пользователь этот промокод
+    cursor.execute("SELECT * FROM promocode_uses WHERE promocode_id = ? AND user_id = ?", (promocode_id, user_id))
+    if cursor.fetchone():
+        return False, "Вы уже использовали этот промокод"
+    
+    # Начисляем награду
+    update_balance(user_id, reward, "", "", "")
+    
+    # Обновляем счётчик использований
+    cursor.execute("UPDATE promocodes SET uses_count = uses_count + 1 WHERE id = ?", (promocode_id,))
+    
+    # Сохраняем использование
+    cursor.execute("INSERT INTO promocode_uses (promocode_id, user_id) VALUES (?, ?)", (promocode_id, user_id))
+    
+    conn.commit()
+    return True, f"✅ Вы получили {reward} восьмерят по промокоду!"
+
+def delete_promocode(code):
+    cursor.execute("DELETE FROM promocodes WHERE code = ?", (code,))
+    conn.commit()
+
+def get_all_promocodes():
+    cursor.execute("SELECT * FROM promocodes ORDER BY created_at DESC")
+    return cursor.fetchall()
+
 # === ПРОВЕРКИ ===
 def is_private_chat(message: Message) -> bool:
     return message.chat.type == "private"
@@ -355,7 +434,8 @@ async def cmd_start(message: Message):
                              "/rank - уровень\n"
                              "/feedback - отправить отзыв\n"
                              "/bug_report - сообщить об ошибке\n"
-                             "/suggest - предложить улучшение")
+                             "/suggest - предложить улучшение\n"
+                             "/use_promocode - использовать промокод")
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message):
@@ -656,6 +736,31 @@ async def process_bug_report(message: Message, state: FSMContext):
 async def process_suggestion(message: Message, state: FSMContext):
     add_feedback(message.from_user.id, "suggestion", message.text)
     await message.answer("✅ Спасибо за ваше предложение! Мы рассмотрим его.")
+    await state.clear()
+
+# === СИСТЕМА ПРОМОКОДОВ ===
+@router.message(Command("use_promocode"))
+async def cmd_use_promocode(message: Message, state: FSMContext):
+    if not is_group_chat(message):
+        await message.answer(MSG_ONLY_IN_GROUP)
+        return
+    
+    await message.answer("Введите промокод:")
+    await state.set_state(PromocodeStates.code)
+
+class PromocodeStates(StatesGroup):
+    code = State()
+
+@router.message(PromocodeStates.code)
+async def process_promocode(message: Message, state: FSMContext):
+    code = message.text.strip()
+    success, result = use_promocode(code, message.from_user.id)
+    
+    if success:
+        await message.answer(result)
+    else:
+        await message.answer(result)
+    
     await state.clear()
 
 @router.message(Command("apply_vosemyata"))
@@ -976,6 +1081,7 @@ async def cmd_admin(message: Message):
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 Заявки", callback_data="admin_requests")
     builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
+    builder.button(text="🏷️ Промокоды", callback_data="admin_promocodes")
     builder.button(text="🛒 Магазин", callback_data="admin_shop")
     builder.button(text="👥 Топ", callback_data="admin_top")
     builder.button(text="📜 История", callback_data="admin_history")
@@ -1077,7 +1183,132 @@ async def transfer_to_user(call: CallbackQuery):
     await call.message.edit_text(f"Введите сумму для перевода пользователю с ID {target_user_id}:\n\nПример: /adjust {target_user_id} 8")
     await call.answer()
 
-# === АДМИН-ПАНЕЛЬ ===
+# === АДМИН-ПАНЕЛЬ ПРОМОКОДОВ ===
+@router.callback_query(lambda c: c.data == "admin_promocodes")
+async def admin_promocodes(call: CallbackQuery):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+    
+    promocodes = get_all_promocodes()
+    if not promocodes:
+        text = "🏷️ Нет созданных промокодов."
+    else:
+        text = "🏷️ Все промокоды:\n\n"
+        for p in promocodes:
+            _, code, reward, uses_limit, uses_count, creator_id, created_at, expires_at = p
+            status = f" ({uses_count}/{uses_limit})" if uses_limit != 0 else ""
+            expires = f" (до {expires_at})" if expires_at else ""
+            text += f"• `{code}`: {reward} восьмерят{status}{expires}\n"
+    
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Создать", callback_data="create_promocode")
+    builder.button(text="🗑️ Удалить", callback_data="delete_promocode")
+    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
+    
+    await call.message.edit_text(text, reply_markup=builder.as_markup())
+    await call.answer()
+
+@router.callback_query(lambda c: c.data == "create_promocode")
+async def create_promocode_prompt(call: CallbackQuery, state: FSMContext):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+    
+    await call.message.answer("Введите награду за промокод (в восьмерятах):")
+    await state.set_state(AdminPromocodeStates.create_reward)
+
+@router.callback_query(lambda c: c.data == "delete_promocode")
+async def delete_promocode_prompt(call: CallbackQuery, state: FSMContext):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+    
+    await call.message.answer("Введите промокод для удаления:")
+    await state.set_state(AdminPromocodeStates.delete_code)
+
+class AdminPromocodeStates(StatesGroup):
+    create_reward = State()
+    create_uses = State()
+    create_expires = State()
+    delete_code = State()
+
+@router.message(AdminPromocodeStates.create_reward)
+async def create_promocode_reward(message: Message, state: FSMContext):
+    try:
+        reward = int(message.text)
+        if reward <= 0:
+            await message.answer("Награда должна быть положительной.")
+            return
+        await state.update_data(reward=reward)
+        await message.answer("Введите лимит использований (0 для бесконечного):")
+        await state.set_state(AdminPromocodeStates.create_uses)
+    except ValueError:
+        await message.answer("Введите корректное число.")
+
+@router.message(AdminPromocodeStates.create_uses)
+async def create_promocode_uses(message: Message, state: FSMContext):
+    try:
+        uses = int(message.text)
+        if uses < 0:
+            await message.answer("Лимит должен быть неотрицательным.")
+            return
+        await state.update_data(uses=uses)
+        await message.answer("Введите срок действия в днях (0 для бессрочного, макс. 365):")
+        await state.set_state(AdminPromocodeStates.create_expires)
+    except ValueError:
+        await message.answer("Введите корректное число.")
+
+@router.message(AdminPromocodeStates.create_expires)
+async def create_promocode_expires(message: Message, state: FSMContext):
+    try:
+        days = int(message.text)
+        if days < 0 or days > 365:
+            await message.answer("Введите число от 0 до 365.")
+            return
+        
+        data = await state.get_data()
+        reward = data['reward']
+        uses = data['uses']
+        
+        expires_at = None
+        if days > 0:
+            expires_at = (datetime.now() + timedelta(days=days)).isoformat()
+        
+        code = create_promocode(reward, uses if uses > 0 else 999999, expires_at)
+        cursor.execute("UPDATE promocodes SET creator_id = ? WHERE code = ?", (message.from_user.id, code))
+        conn.commit()
+        
+        await message.answer(f"✅ Промокод создан:\n\n`{code}`\nНаграда: {reward} восьмерят\nЛимит: {uses if uses > 0 else 'бесконечный'}\nСрок: {'бессрочный' if days == 0 else f'{days} дней'}")
+    except ValueError:
+        await message.answer("Введите корректное число.")
+    finally:
+        await state.clear()
+
+@router.message(AdminPromocodeStates.delete_code)
+async def delete_promocode_process(message: Message, state: FSMContext):
+    code = message.text.strip()
+    promocode = get_promocode_by_code(code)
+    
+    if not promocode:
+        await message.answer("❌ Промокод не найден.")
+    else:
+        delete_promocode(code)
+        await message.answer(f"✅ Промокод `{code}` удалён.")
+    
+    await state.clear()
+
+# === ОСТАЛЬНЫЕ КОЛБЭКИ ===
 @router.callback_query(lambda c: c.data == "back_to_main")
 async def back_to_main_menu(call: CallbackQuery):
     if not is_private_chat(call.message):
@@ -1091,6 +1322,7 @@ async def back_to_main_menu(call: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 Заявки", callback_data="admin_requests")
     builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
+    builder.button(text="🏷️ Промокоды", callback_data="admin_promocodes")
     builder.button(text="🛒 Магазин", callback_data="admin_shop")
     builder.button(text="👥 Топ", callback_data="admin_top")
     builder.button(text="📜 История", callback_data="admin_history")
