@@ -133,6 +133,17 @@ def ensure_schema():
         )
     ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            message TEXT,
+            date TEXT DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending'
+        )
+    ''')
+
     # Проверяем, существуют ли столбцы
     cursor.execute("PRAGMA table_info(users)")
     columns = [row[1] for row in cursor.fetchall()]
@@ -279,6 +290,14 @@ def update_daily_stats(requests=0, approved=0, transfers=0, amount=0):
     )
     conn.commit()
 
+def add_feedback(user_id, feedback_type, message):
+    cursor.execute("INSERT INTO feedback (user_id, type, message) VALUES (?, ?, ?)", (user_id, feedback_type, message))
+    conn.commit()
+
+def get_pending_feedback():
+    cursor.execute("SELECT id, user_id, type, message FROM feedback WHERE status = 'pending'")
+    return cursor.fetchall()
+
 # === ПРОВЕРКИ ===
 def is_private_chat(message: Message) -> bool:
     return message.chat.type == "private"
@@ -333,7 +352,10 @@ async def cmd_start(message: Message):
                              "/profile - профиль\n"
                              "/gift - подарить восьмеряти\n"
                              "/dice - игра в кости\n"
-                             "/rank - уровень")
+                             "/rank - уровень\n"
+                             "/feedback - отправить отзыв\n"
+                             "/bug_report - сообщить об ошибке\n"
+                             "/suggest - предложить улучшение")
 
 @router.message(Command("balance"))
 async def cmd_balance(message: Message):
@@ -584,6 +606,57 @@ async def cmd_dice(message: Message):
     conn.commit()
     
     await message.answer(result_text)
+
+# === СИСТЕМА ОБРАТНОЙ СВЯЗИ ===
+@router.message(Command("feedback"))
+async def cmd_feedback(message: Message, state: FSMContext):
+    if not is_private_chat(message):
+        await message.answer(MSG_ONLY_IN_PRIVATE)
+        return
+    
+    await message.answer("Введите ваш отзыв:")
+    await state.set_state(FeedbackStates.feedback_message)
+
+@router.message(Command("bug_report"))
+async def cmd_bug_report(message: Message, state: FSMContext):
+    if not is_private_chat(message):
+        await message.answer(MSG_ONLY_IN_PRIVATE)
+        return
+    
+    await message.answer("Опишите ошибку, которую вы нашли:")
+    await state.set_state(FeedbackStates.bug_message)
+
+@router.message(Command("suggest"))
+async def cmd_suggest(message: Message, state: FSMContext):
+    if not is_private_chat(message):
+        await message.answer(MSG_ONLY_IN_PRIVATE)
+        return
+    
+    await message.answer("Предложите улучшение для бота:")
+    await state.set_state(FeedbackStates.suggestion_message)
+
+class FeedbackStates(StatesGroup):
+    feedback_message = State()
+    bug_message = State()
+    suggestion_message = State()
+
+@router.message(FeedbackStates.feedback_message)
+async def process_feedback(message: Message, state: FSMContext):
+    add_feedback(message.from_user.id, "feedback", message.text)
+    await message.answer("✅ Спасибо за ваш отзыв! Мы рассмотрим его в ближайшее время.")
+    await state.clear()
+
+@router.message(FeedbackStates.bug_message)
+async def process_bug_report(message: Message, state: FSMContext):
+    add_feedback(message.from_user.id, "bug", message.text)
+    await message.answer("✅ Спасибо за сообщение об ошибке! Мы постараемся исправить её как можно скорее.")
+    await state.clear()
+
+@router.message(FeedbackStates.suggestion_message)
+async def process_suggestion(message: Message, state: FSMContext):
+    add_feedback(message.from_user.id, "suggestion", message.text)
+    await message.answer("✅ Спасибо за ваше предложение! Мы рассмотрим его.")
+    await state.clear()
 
 @router.message(Command("apply_vosemyata"))
 async def cmd_apply(message: Message):
@@ -902,6 +975,7 @@ async def cmd_admin(message: Message):
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 Заявки", callback_data="admin_requests")
+    builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
     builder.button(text="🛒 Магазин", callback_data="admin_shop")
     builder.button(text="👥 Топ", callback_data="admin_top")
     builder.button(text="📜 История", callback_data="admin_history")
@@ -1016,6 +1090,7 @@ async def back_to_main_menu(call: CallbackQuery):
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 Заявки", callback_data="admin_requests")
+    builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
     builder.button(text="🛒 Магазин", callback_data="admin_shop")
     builder.button(text="👥 Топ", callback_data="admin_top")
     builder.button(text="📜 История", callback_data="admin_history")
@@ -1050,6 +1125,48 @@ async def admin_requests(call: CallbackQuery):
     
     await call.message.edit_text(text, reply_markup=builder.as_markup())
     await call.answer()
+
+@router.callback_query(lambda c: c.data == "admin_feedback")
+async def admin_feedback(call: CallbackQuery):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+    
+    feedbacks = get_pending_feedback()
+    if not feedbacks:
+        await call.message.edit_text("Нет новых сообщений обратной связи.", reply_markup=back_to_main())
+        await call.answer()
+        return
+
+    text = "💬 Новые сообщения обратной связи:\n\n"
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    builder = InlineKeyboardBuilder()
+    for f in feedbacks:
+        text += f"ID {f[0]} от {f[1]} ({f[2]}): {f[3]}\n\n"
+        builder.button(text=f"✅ Отметить #{f[0]}", callback_data=f"feedback_done_{f[0]}")
+    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
+    
+    await call.message.edit_text(text, reply_markup=builder.as_markup())
+    await call.answer()
+
+@router.callback_query(lambda c: c.data.startswith("feedback_done_"))
+async def feedback_done(call: CallbackQuery):
+    if not is_private_chat(call.message):
+        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+        return
+    if not is_admin(call.from_user.id):
+        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+        return
+    
+    feedback_id = int(call.data.split("_")[2])
+    cursor.execute("UPDATE feedback SET status = 'done' WHERE id = ?", (feedback_id,))
+    conn.commit()
+    
+    await call.answer("✅ Сообщение отмечено как обработанное.")
+    await admin_feedback(call)
 
 # === Отправка медиа админу при одобрении/отклонении ===
 async def send_media_to_admin(req_id, user_id, reason, media_id, media_type, admin_id, action):
