@@ -1,1720 +1,1109 @@
 import sqlite3
-import logging
-from datetime import datetime, date, timedelta
-from aiogram import Bot, Dispatcher, Router
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-import asyncio
-from typing import Optional
-import re
 import random
-import string
+import logging
+import json
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ConversationHandler
+)
 
-# === НАСТРОЙКА ЛОГИРОВАНИЯ ===
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler("vosemyata.log", encoding="utf-8"),
+        logging.FileHandler('vosemyata.log'),
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
-# Токен бота
-BOT_TOKEN = "8035757633:AAG0_AQQJxkdRQzLcWSDJw2h82sA1Mg31sg"
+# --- КОНСТАНТЫ ---
+BOT_TOKEN = '8537096347:AAHjr5TsYwKT5e75oP-mT7gdnJV3vSSQvEk'
 ADMINS = [5171361978, 8268613975, 2143824530]
+START_BALANCE = 100
+WORK_COOLDOWN = 600
+WORK2_COOLDOWN = 1800
+WORK3_COOLDOWN = 3600
+WORK4_COOLDOWN = 7200
+TRANSFER_LIMIT_PER_USER = 3
+PROMOCODE_REWARD = 50
+WEEKLY_REWARD_BASE = 50
+WEEKLY_REWARD_PER_LEVEL = 5
+DAILY_BANK_INTEREST_RATE = 0.01
 
-# Инициализация
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=storage)
-router = Router()
+# --- СОСТОЯНИЯ FSM ---
+(
+    CREATE_PROMO_REWARD,
+    CREATE_PROMO_USES,
+    CREATE_PROMO_EXPIRES,
+    DELETE_PROMO_CODE,
+    ADD_ITEM_NAME,
+    ADD_ITEM_PRICE,
+    ADD_ITEM_DESC,
+    DELETE_ITEM_ID,
+    ADMIN_ADJUST_INPUT
+) = range(9)
 
-# Подключение к базе данных
-conn = sqlite3.connect("vosemyata.db", check_same_thread=False)
+# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
+conn = sqlite3.connect('vosemyata.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# === КОНСТАНТЫ ===
-BACK_BUTTON = "⬅️ Назад"
-MSG_ONLY_IN_GROUP = "❌ Эта команда доступна только в группе."
-MSG_ONLY_IN_PRIVATE = "❌ Команда доступна только в личных сообщениях."
-MSG_ACCESS_DENIED = "❌ Доступ запрещён."
-MSG_ONLY_IN_PRIVATE_ALERT = "❌ Команда доступна только в личных сообщениях."
-MSG_ACCESS_DENIED_ALERT = "❌ Доступ запрещён."
+# --- СОЗДАНИЕ ТАБЛИЦ ---
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    balance INTEGER DEFAULT 0,
+    bank_balance INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    exp INTEGER DEFAULT 0,
+    last_work_time REAL,
+    last_work2_time REAL,
+    last_work3_time REAL,
+    last_work4_time REAL,
+    daily_bank_interest_time REAL,
+    weekly_claimed_date TEXT,
+    transfers_today TEXT DEFAULT '{}',
+    profile_description TEXT DEFAULT 'Нет описания',
+    profile_skin TEXT DEFAULT 'обычный'
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS promocodes (
+    code TEXT PRIMARY KEY,
+    reward INTEGER,
+    uses_limit INTEGER,
+    uses_count INTEGER DEFAULT 0,
+    creator_id INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS used_promocodes (
+    user_id INTEGER,
+    code TEXT,
+    used_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, code)
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS shop_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    description TEXT
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS applications (
+    app_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    first_name TEXT,
+    reason TEXT,
+    status TEXT DEFAULT 'pending',
+    admin_id INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS games (
+    game_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    game_type TEXT,
+    bet INTEGER,
+    result INTEGER,
+    date TEXT DEFAULT CURRENT_TIMESTAMP
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    type TEXT,
+    message TEXT,
+    date TEXT DEFAULT CURRENT_TIMESTAMP
+)
+''')
+conn.commit()
 
-# === ФУНКЦИЯ ОБНОВЛЕНИЯ СХЕМЫ БД ===
-def ensure_schema():
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0,
-            first_name TEXT,
-            last_name TEXT,
-            join_date TEXT DEFAULT CURRENT_TIMESTAMP,
-            total_requests INTEGER DEFAULT 0,
-            approved_requests INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            xp INTEGER DEFAULT 0,
-            weekly_claimed_date TEXT DEFAULT NULL,
-            bank_balance INTEGER DEFAULT 0,
-            profile_description TEXT DEFAULT NULL,
-            profile_skin TEXT DEFAULT NULL,
-            last_daily_bonus TEXT DEFAULT NULL
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            first_name TEXT,
-            reason TEXT,
-            media_id TEXT DEFAULT NULL,
-            media_type TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'pending',
-            admin_id INTEGER DEFAULT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS shop (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            price INTEGER,
-            description TEXT DEFAULT NULL
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transfers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER,
-            receiver_id INTEGER,
-            amount INTEGER,
-            date TEXT
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT DEFAULT CURRENT_TIMESTAMP,
-            total_requests INTEGER DEFAULT 0,
-            approved_requests INTEGER DEFAULT 0,
-            total_transfers INTEGER DEFAULT 0,
-            total_amount_transferred INTEGER DEFAULT 0
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS gifts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER,
-            receiver_id INTEGER,
-            amount INTEGER,
-            message TEXT DEFAULT NULL,
-            date TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS games (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            game_type TEXT,
-            bet INTEGER,
-            result INTEGER,
-            date TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            type TEXT,
-            message TEXT,
-            date TEXT DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'pending'
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS promocodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            reward INTEGER,
-            uses_limit INTEGER,
-            uses_count INTEGER DEFAULT 0,
-            creator_id INTEGER,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            expires_at TEXT DEFAULT NULL
-        )
-    ''')
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS promocode_uses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            promocode_id INTEGER,
-            user_id INTEGER,
-            used_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    # Проверяем, существуют ли столбцы
-    cursor.execute("PRAGMA table_info(users)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if 'level' not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN level INTEGER DEFAULT 1")
-        cursor.execute("ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0")
-        cursor.execute("ALTER TABLE users ADD COLUMN weekly_claimed_date TEXT DEFAULT NULL")
-        cursor.execute("ALTER TABLE users ADD COLUMN bank_balance INTEGER DEFAULT 0")
-        cursor.execute("ALTER TABLE users ADD COLUMN profile_description TEXT DEFAULT NULL")
-        cursor.execute("ALTER TABLE users ADD COLUMN profile_skin TEXT DEFAULT NULL")
-        cursor.execute("ALTER TABLE users ADD COLUMN last_daily_bonus TEXT DEFAULT NULL")
-        print("✅ Новые столбцы добавлены в таблицу users")
-
-    conn.commit()
-
-ensure_schema()
-
-def get_user_balance(user_id):
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else 0
-
-def get_user_bank_balance(user_id):
-    cursor.execute("SELECT bank_balance FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else 0
-
-def update_balance(user_id, amount, username="unknown", first_name=None, last_name=None):
-    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_user_data(user_id, effective_user=None):
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     if result:
-        new_balance = result[0] + amount
-        cursor.execute(
-            "UPDATE users SET balance = ?, username = ?, first_name = ?, last_name = ? WHERE user_id = ?",
-            (new_balance, username, first_name, last_name, user_id)
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO users (user_id, username, balance, first_name, last_name) VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, amount, first_name, last_name)
-        )
-    conn.commit()
-    logging.info(f"ADJUST | User: {user_id} (@{username}) | Amount: {amount} | New: {get_user_balance(user_id)}")
-
-def add_xp(user_id, xp_amount):
-    cursor.execute("SELECT xp, level FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    if result:
-        current_xp, current_level = result
-        new_xp = current_xp + xp_amount
-        new_level = current_level
-        # Уровень повышается каждые 100 XP
-        while new_xp >= 100:
-            new_xp -= 100
-            new_level += 1
-        cursor.execute("UPDATE users SET xp = ?, level = ? WHERE user_id = ?", (new_xp, new_level, user_id))
-        conn.commit()
-        return new_level
-    return 1
-
-def get_user_level(user_id):
-    cursor.execute("SELECT level, xp FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result if result else (1, 0)
-
-def add_request(user_id, username, first_name, reason, media_id=None, media_type=None):
-    cursor.execute(
-        "INSERT INTO requests (user_id, username, first_name, reason, media_id, media_type) VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, username, first_name, reason, media_id, media_type)
-    )
-    cursor.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-
-def get_pending_requests():
-    cursor.execute("SELECT id, user_id, username, first_name, reason, media_id, media_type FROM requests WHERE status = 'pending'")
-    return cursor.fetchall()
-
-def get_request_history(limit=20):
-    cursor.execute("SELECT id, user_id, username, reason, status, admin_id FROM requests ORDER BY id DESC LIMIT ?", (limit,))
-    return cursor.fetchall()
-
-def update_request_status(req_id, status, admin_id):
-    cursor.execute("UPDATE requests SET status = ?, admin_id = ? WHERE id = ?", (status, admin_id, req_id))
-    if status == 'approved':
-        cursor.execute("SELECT user_id FROM requests WHERE id = ?", (req_id,))
-        user_id = cursor.fetchone()[0]
-        update_balance(user_id, 8)
-        add_xp(user_id, 10)
-        cursor.execute("UPDATE users SET approved_requests = approved_requests + 1 WHERE user_id = ?", (user_id,))
-        logging.info(f"APPROVE | Request #{req_id} | User: {user_id} | Admin: {admin_id}")
-    elif status == 'declined':
-        cursor.execute("SELECT user_id FROM requests WHERE id = ?", (req_id,))
-        user_id = cursor.fetchone()[0]
-        logging.info(f"DECLINE | Request #{req_id} | User: {user_id} | Admin: {admin_id}")
-    conn.commit()
-
-def get_shop_items():
-    cursor.execute("SELECT id, name, price, description FROM shop")
-    return cursor.fetchall()
-
-def add_item_to_shop(name, price, description=None):
-    cursor.execute("INSERT INTO shop (name, price, description) VALUES (?, ?, ?)", (name, price, description))
-    conn.commit()
-
-def get_top_users(limit=10):
-    cursor.execute("SELECT user_id, username, first_name, balance, level FROM users ORDER BY balance DESC LIMIT ?", (limit,))
-    return cursor.fetchall()
-
-def buy_item_by_id(user_id, item_id):
-    items = get_shop_items()
-    item = next((i for i in items if i[0] == item_id), None)
-    if not item:
-        return False, "Товар не найден"
-    price = item[2]
-    balance = get_user_balance(user_id)
-    if balance < price:
-        return False, "Недостаточно восьмерят"
-    update_balance(user_id, -price)
-    return True, f"Вы купили {item[1]}!"
-
-def get_user_stats(user_id):
-    cursor.execute("SELECT total_requests, approved_requests FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result if result else (0, 0)
-
-def get_daily_stats():
-    today = date.today().isoformat()
-    cursor.execute("SELECT * FROM daily_stats WHERE date = ?", (today,))
-    result = cursor.fetchone()
-    if not result:
-        cursor.execute(
-            "INSERT INTO daily_stats (date, total_requests, approved_requests, total_transfers, total_amount_transferred) VALUES (?, 0, 0, 0, 0)",
-            (today,)
-        )
-        conn.commit()
-        return (today, 0, 0, 0, 0)
-    return result
-
-def update_daily_stats(requests=0, approved=0, transfers=0, amount=0):
-    today = date.today().isoformat()
-    cursor.execute(
-        "UPDATE daily_stats SET total_requests = total_requests + ?, approved_requests = approved_requests + ?, total_transfers = total_transfers + ?, total_amount_transferred = total_amount_transferred + ? WHERE date = ?",
-        (requests, approved, transfers, amount, today)
-    )
-    conn.commit()
-
-def add_feedback(user_id, feedback_type, message):
-    cursor.execute("INSERT INTO feedback (user_id, type, message) VALUES (?, ?, ?)", (user_id, feedback_type, message))
-    conn.commit()
-
-def get_pending_feedback():
-    cursor.execute("SELECT id, user_id, type, message FROM feedback WHERE status = 'pending'")
-    return cursor.fetchall()
-
-# === ФУНКЦИИ ДЛЯ ПРОМОКОДОВ ===
-def generate_promocode(length=8):
-    chars = string.ascii_uppercase + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
-
-def create_promocode(reward, uses_limit, expires_at=None):
-    code = generate_promocode()
-    cursor.execute(
-        "INSERT INTO promocodes (code, reward, uses_limit, creator_id) VALUES (?, ?, ?, ?)",
-        (code, reward, uses_limit, 0)  # creator_id временно 0, будет обновлён в вызывающем коде
-    )
-    conn.commit()
-    return code
-
-def get_promocode_by_code(code):
-    cursor.execute("SELECT * FROM promocodes WHERE code = ?", (code,))
-    return cursor.fetchone()
-
-def use_promocode(code, user_id):
-    promocode = get_promocode_by_code(code)
-    if not promocode:
-        return False, "Промокод не найден"
-    
-    promocode_id, code, reward, uses_limit, uses_count, creator_id, created_at, expires_at = promocode
-    
-    if expires_at and datetime.now() > datetime.fromisoformat(expires_at):
-        return False, "Срок действия промокода истёк"
-    
-    if uses_count >= uses_limit:
-        return False, "Лимит использований промокода исчерпан"
-    
-    # Проверяем, использовал ли пользователь этот промокод
-    cursor.execute("SELECT * FROM promocode_uses WHERE promocode_id = ? AND user_id = ?", (promocode_id, user_id))
-    if cursor.fetchone():
-        return False, "Вы уже использовали этот промокод"
-    
-    # Начисляем награду
-    update_balance(user_id, reward, "", "", "")
-    
-    # Обновляем счётчик использований
-    cursor.execute("UPDATE promocodes SET uses_count = uses_count + 1 WHERE id = ?", (promocode_id,))
-    
-    # Сохраняем использование
-    cursor.execute("INSERT INTO promocode_uses (promocode_id, user_id) VALUES (?, ?)", (promocode_id, user_id))
-    
-    conn.commit()
-    return True, f"✅ Вы получили {reward} восьмерят по промокоду!"
-
-def delete_promocode(code):
-    cursor.execute("DELETE FROM promocodes WHERE code = ?", (code,))
-    conn.commit()
-
-def get_all_promocodes():
-    cursor.execute("SELECT * FROM promocodes ORDER BY created_at DESC")
-    return cursor.fetchall()
-
-# === ПРОВЕРКИ ===
-def is_private_chat(message: Message) -> bool:
-    return message.chat.type == "private"
-
-def is_group_chat(message: Message) -> bool:
-    return message.chat.type in ["group", "supergroup"]
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
-# === НОВАЯ ФУНКЦИЯ: проверка лимита переводов в день ===
-def get_transfer_count_today(sender_id, receiver_id):
-    today = date.today().isoformat()
-    cursor.execute(
-        "SELECT COUNT(*) FROM transfers WHERE sender_id = ? AND receiver_id = ? AND date = ?",
-        (sender_id, receiver_id, today)
-    )
-    return cursor.fetchone()[0]
-
-def add_transfer(sender_id, receiver_id, amount):
-    today = date.today().isoformat()
-    cursor.execute(
-        "INSERT INTO transfers (sender_id, receiver_id, amount, date) VALUES (?, ?, ?, ?)",
-        (sender_id, receiver_id, amount, today)
-    )
-    update_daily_stats(transfers=1, amount=amount)
-    conn.commit()
-
-# === КНОПКИ ===
-def back_to_main():
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    return builder.as_markup()
-
-# === ОБЩИЕ КОМАНДЫ (работают только в группе) ===
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    if is_group_chat(message):
-        await message.answer("Привет! Это бот восьмерята. Используй /balance, /apply_vosemyata, /shop.")
-    else:
-        await message.answer("Привет! Это бот восьмерята.\n\n"
-                             "Доступные команды:\n"
-                             "/balance - проверить баланс\n"
-                             "/apply_vosemyata - подать заявку\n"
-                             "/shop - магазин\n"
-                             "/top - топ пользователей\n"
-                             "/transfer - перевести восьмеряти\n"
-                             "/stats - статистика\n"
-                             "/weekly - получить еженедельную награду\n"
-                             "/bank - банк\n"
-                             "/profile - профиль\n"
-                             "/gift - подарить восьмеряти\n"
-                             "/dice - игра в кости\n"
-                             "/rank - уровень\n"
-                             "/feedback - отправить отзыв\n"
-                             "/bug_report - сообщить об ошибке\n"
-                             "/suggest - предложить улучшение\n"
-                             "/use_promocode - использовать промокод\n"
-                             "/create_promocode - создать промокод (только для админов)")
-
-@router.message(Command("balance"))
-async def cmd_balance(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    balance = get_user_balance(message.from_user.id)
-    total_req, approved_req = get_user_stats(message.from_user.id)
-    level, xp = get_user_level(message.from_user.id)
-    await message.answer(f"Ваш баланс: {balance} восьмерят.\n"
-                         f"Уровень: {level} (XP: {xp}/100)\n"
-                         f"Заявок подано: {total_req}\n"
-                         f"Одобрено: {approved_req}")
-
-@router.message(Command("stats"))
-async def cmd_stats(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    total_req, approved_req = get_user_stats(message.from_user.id)
-    success_rate = (approved_req / total_req * 100) if total_req > 0 else 0
-    level, xp = get_user_level(message.from_user.id)
-    await message.answer(f"📊 Ваша статистика:\n"
-                         f"Уровень: {level} (XP: {xp}/100)\n"
-                         f"Заявок подано: {total_req}\n"
-                         f"Одобрено: {approved_req}\n"
-                         f"Успешность: {success_rate:.1f}%")
-
-@router.message(Command("rank"))
-async def cmd_rank(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    level, xp = get_user_level(message.from_user.id)
-    await message.answer(f"🏆 Ваш уровень: {level}\n"
-                         f"Опыт: {xp}/100\n"
-                         f"До следующего уровня: {100 - xp} XP")
-
-@router.message(Command("weekly"))
-async def cmd_weekly(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    cursor.execute("SELECT weekly_claimed_date FROM users WHERE user_id = ?", (message.from_user.id,))
-    result = cursor.fetchone()
-    last_claimed = result[0] if result else None
-    
-    if last_claimed:
         try:
-            last_date = datetime.fromisoformat(last_claimed)
-            if datetime.now() - last_date < timedelta(days=7):
-                days_left = 7 - (datetime.now() - last_date).days
-                await message.answer(f"❌ Вы уже получили еженедельную награду. Приходите через {days_left} дней.")
-                return
-        except ValueError:
-            pass
-    
-    reward = 50  # базовая награда
-    level, _ = get_user_level(message.from_user.id)
-    bonus = level * 5  # бонус за уровень
-    total_reward = reward + bonus
-    
-    update_balance(message.from_user.id, total_reward, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-    cursor.execute("UPDATE users SET weekly_claimed_date = ? WHERE user_id = ?", (datetime.now().isoformat(), message.from_user.id))
+            transfers_today = json.loads(result[12]) if result[12] else {}
+        except:
+            transfers_today = {}
+        user = {
+            'user_id': result[0],
+            'username': result[1],
+            'balance': result[2],
+            'bank_balance': result[3],
+            'level': result[4],
+            'exp': result[5],
+            'last_work_time': result[6] or 0,
+            'last_work2_time': result[7] or 0,
+            'last_work3_time': result[8] or 0,
+            'last_work4_time': result[9] or 0,
+            'daily_bank_interest_time': result[10] or 0,
+            'weekly_claimed_date': result[11],
+            'transfers_today': transfers_today,
+            'profile_description': result[13],
+            'profile_skin': result[14]
+        }
+        if effective_user and effective_user.username != user['username']:
+            update_user_data(user_id, username=effective_user.username)
+            user['username'] = effective_user.username
+        return user
+    else:
+        username = effective_user.username if effective_user else ''
+        new_user = {
+            'user_id': user_id,
+            'username': username,
+            'balance': START_BALANCE,
+            'bank_balance': 0,
+            'level': 1,
+            'exp': 0,
+            'last_work_time': 0,
+            'last_work2_time': 0,
+            'last_work3_time': 0,
+            'last_work4_time': 0,
+            'daily_bank_interest_time': 0,
+            'weekly_claimed_date': None,
+            'transfers_today': {},
+            'profile_description': 'Нет описания',
+            'profile_skin': 'обычный'
+        }
+        cursor.execute(
+            "INSERT INTO users (user_id, username, balance, level, exp, profile_description, profile_skin) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, username, new_user['balance'], new_user['level'], new_user['exp'], new_user['profile_description'], new_user['profile_skin'])
+        )
+        conn.commit()
+        return new_user
+
+def update_user_data(user_id, **kwargs):
+    allowed_fields = {
+        'username', 'balance', 'bank_balance', 'level', 'exp',
+        'last_work_time', 'last_work2_time', 'last_work3_time', 'last_work4_time',
+        'daily_bank_interest_time', 'weekly_claimed_date', 'transfers_today',
+        'profile_description', 'profile_skin'
+    }
+    fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+    if not fields:
+        return
+    set_clause = ", ".join([f"{key} = ?" for key in fields])
+    values = list(fields.values()) + [user_id]
+    cursor.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", values)
     conn.commit()
-    
-    await message.answer(f"🎉 Вы получили еженедельную награду: {total_reward} восьмерят! (База: {reward}, Бонус: {bonus})")
 
-@router.message(Command("bank"))
-async def cmd_bank(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    balance = get_user_balance(message.from_user.id)
-    bank_balance = get_user_bank_balance(message.from_user.id)
-    
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💰 Положить", callback_data="bank_deposit")
-    builder.button(text="💸 Снять", callback_data="bank_withdraw")
-    builder.button(text="📊 Инфо", callback_data="bank_info")
-    
-    await message.answer(f"🏦 Банк восьмерят:\n"
-                         f"Ваш баланс: {balance} восьмерят\n"
-                         f"В банке: {bank_balance} восьмерят", 
-                         reply_markup=builder.as_markup())
+def add_exp(user_id, exp):
+    user = get_user_data(user_id)
+    new_exp = user['exp'] + exp
+    level_up = 0
+    while new_exp >= user['level'] * 100:
+        new_exp -= user['level'] * 100
+        level_up += 1
+    new_level = user['level'] + level_up
+    update_user_data(user_id, exp=new_exp, level=new_level)
+    return new_level, new_exp
 
-@router.message(Command("profile"))
-async def cmd_profile(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    cursor.execute("SELECT username, first_name, last_name, profile_description, profile_skin FROM users WHERE user_id = ?", (message.from_user.id,))
-    result = cursor.fetchone()
-    if not result:
-        await message.answer("❌ Вы ещё не зарегистрированы. Сделайте что-нибудь в боте.")
-        return
-    
-    username, first_name, last_name, description, skin = result
-    full_name = f"{first_name or ''} {last_name or ''}".strip() or username
-    level, xp = get_user_level(message.from_user.id)
-    balance = get_user_balance(message.from_user.id)
-    
-    skin_text = f" | Скин: {skin}" if skin else ""
-    
-    profile_text = f"👤 Профиль {full_name} (@{username}){skin_text}\n"
-    profile_text += f"💰 Баланс: {balance} восьмерят\n"
-    profile_text += f"🏆 Уровень: {level} (XP: {xp}/100)\n"
-    
-    if description:
-        profile_text += f"📝 Описание: {description}\n"
-    
-    profile_text += f"\n/setskin - сменить скин\n/setdesc - сменить описание"
-    
-    await message.answer(profile_text)
 
-@router.message(Command("setskin"))
-async def cmd_set_skin(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Используйте: /setskin названиеСкина")
-        return
-    
-    skin = args[1]
-    cursor.execute("UPDATE users SET profile_skin = ? WHERE user_id = ?", (skin, message.from_user.id))
-    conn.commit()
-    await message.answer(f"✅ Скин изменён на: {skin}")
+# --- ОСНОВНЫЕ КОМАНДЫ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+🎮 Игры и развлечения:
+/dice <ставка> — Игра в кости. 4-6 — выиграл (ставка x2).
+/black_red <ставка> <red/black> — Рулетка. Выигрыш x2.
+/ladder <ставка> — Лесенка: 1-2 (x3), 3-5 (x2), 6 (проигрыш).
+/rank — Уровень и опыт.
+💰 Финансы:
+/balance — Баланс, уровень, статистика.
+/bank — Управление банком.
+/deposit <сумма> — Положить в банк.
+/withdraw <сумма> — Снять из банка.
+/transfer @username <сумма> — Перевести пользователю.
+/gift @username <сумма> <сообщение> — Подарить с сообщением.
+/top — Топ-10 по восьмерятам.
+📦 Магазин:
+/shop — Посмотреть магазин.
+/buy <ID> — Купить товар.
+🎁 Заработок:
+/weekly — Еженедельная награда.
+/work — 1–5 восьмерят (раз в 10 мин).
+/work2 — 3–8 восьмерят (раз в 30 мин).
+/work3 — 5–15 восьмерят (раз в 1 час).
+/work4 — 10–25 восьмерят (раз в 2 часа).
+/apply_vosemyata <причина> — Подать заявку на восьмеряты.
+🎟️ Промокоды:
+/use_promocode <код> — Ввести промокод.
+/create_promocode — Только админ.
+/delete_promocode — Только админ.
+📊 Профиль:
+/profile — Свой профиль.
+/setskin <скин> — Установить скин.
+/setdesc <описание> — Установить описание.
+/stats — Статистика.
+📞 Обратная связь:
+/feedback <сообщение> — Отзыв.
+/bug_report <сообщение> — Ошибка.
+/suggest <сообщение> — Предложение.
+👑 Админ-панель:
+/admin — Открыть панель (админ).
+"""
+    await update.message.reply_text(help_text, disable_notification=True)
 
-@router.message(Command("setdesc"))
-async def cmd_set_desc(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Используйте: /setdesc вашеОписание")
-        return
-    
-    desc = args[1]
-    cursor.execute("UPDATE users SET profile_description = ? WHERE user_id = ?", (desc, message.from_user.id))
-    conn.commit()
-    await message.answer(f"✅ Описание изменено на: {desc}")
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    msg = f"""
+💰 Баланс: {user['balance']} восьмерят
+🏦 В банке: {user['bank_balance']} восьмерят
+🏆 Уровень: {user['level']}
+⚡ Опыт: {user['exp']}
+"""
+    await update.message.reply_text(msg, disable_notification=True)
 
-@router.message(Command("gift"))
-async def cmd_gift(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
+# --- ИГРЫ ---
+async def dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
         return
-    
-    args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        await message.answer("Используйте: /gift @username количество сообщение")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /dice <ставка>", disable_notification=True)
         return
-    
-    target_username = args[1]
     try:
-        amount = int(args[2])
+        bet = int(args[0])
     except ValueError:
-        await message.answer("Количество должно быть числом.")
+        await update.message.reply_text("Ставка должна быть числом.", disable_notification=True)
         return
-    
-    gift_message = args[3] if len(args) > 3 else "Без сообщения"
-    
-    if amount <= 0:
-        await message.answer("Количество должно быть положительным.")
-        return
-    
-    sender_balance = get_user_balance(message.from_user.id)
-    if sender_balance < amount:
-        await message.answer("❌ Недостаточно восьмерят для подарка.")
-        return
-    
-    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username[1:],))
-    receiver = cursor.fetchone()
-    
-    if not receiver:
-        await message.answer(f"❌ Пользователь {target_username} не найден.")
-        return
-    
-    receiver_id, = receiver
-    if receiver_id == message.from_user.id:
-        await message.answer("❌ Нельзя подарить самому себе.")
-        return
-    
-    update_balance(message.from_user.id, -amount, message.from_user.username)
-    update_balance(receiver_id, amount, target_username[1:])
-    
-    cursor.execute("INSERT INTO gifts (sender_id, receiver_id, amount, message) VALUES (?, ?, ?, ?)",
-                   (message.from_user.id, receiver_id, amount, gift_message))
-    conn.commit()
-    
-    try:
-        await bot.send_message(receiver_id, f"🎁 Вам подарили {amount} восьмерят от @{message.from_user.username}!\nСообщение: {gift_message}")
-    except Exception:
-        pass
-    
-    await message.answer(f"🎁 Вы подарили {amount} восьмерят пользователю {target_username} с сообщением: {gift_message}")
-
-@router.message(Command("dice"))
-async def cmd_dice(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Используйте: /dice ставка")
-        return
-    
-    try:
-        bet = int(args[1])
-    except ValueError:
-        await message.answer("Ставка должна быть числом.")
-        return
-    
+    user = get_user_data(update.effective_user.id, update.effective_user)
     if bet <= 0:
-        await message.answer("Ставка должна быть положительной.")
+        await update.message.reply_text("Ставка должна быть больше 0.", disable_notification=True)
         return
-    
-    balance = get_user_balance(message.from_user.id)
-    if balance < bet:
-        await message.answer("❌ Недостаточно восьмерят для ставки.")
+    if user['balance'] < bet:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
         return
-    
-    bot_roll = random.randint(1, 6)
-    user_roll = random.randint(1, 6)
-    
-    if user_roll > bot_roll:
+    roll = random.randint(1, 6)
+    if roll >= 4:
         win_amount = bet * 2
-        update_balance(message.from_user.id, win_amount, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-        result_text = f"🎲 Вы бросили {user_roll}, бот бросил {bot_roll}. Вы выиграли {win_amount} восьмерят!"
-    elif user_roll < bot_roll:
-        update_balance(message.from_user.id, -bet, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-        result_text = f"🎲 Вы бросили {user_roll}, бот бросил {bot_roll}. Вы проиграли {bet} восьмерят."
+        user['balance'] += win_amount
+        msg = f"🎲 Кубик: {roll}. 🎉 Вы выиграли {win_amount} восьмерят!"
+        result = win_amount - bet
     else:
-        result_text = f"🎲 Вы бросили {user_roll}, бот бросил {bot_roll}. Ничья! Ставка возвращена."
-    
+        user['balance'] -= bet
+        msg = f"🎲 Кубик: {roll}. 💀 Вы проиграли {bet} восьмерят."
+        result = -bet
+    update_user_data(update.effective_user.id, balance=user['balance'])
     cursor.execute("INSERT INTO games (user_id, game_type, bet, result) VALUES (?, ?, ?, ?)",
-                   (message.from_user.id, "dice", bet, 1 if user_roll > bot_roll else (-1 if user_roll < bot_roll else 0)))
+                   (update.effective_user.id, 'dice', bet, result))
     conn.commit()
-    
-    await message.answer(result_text)
+    await update.message.reply_text(msg, disable_notification=True)
 
-# === СИСТЕМА ОБРАТНОЙ СВЯЗИ ===
-@router.message(Command("feedback"))
-async def cmd_feedback(message: Message, state: FSMContext):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+async def black_red(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
         return
-    
-    await message.answer("Введите ваш отзыв:")
-    await state.set_state(FeedbackStates.feedback_message)
-
-@router.message(Command("bug_report"))
-async def cmd_bug_report(message: Message, state: FSMContext):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
-        return
-    
-    await message.answer("Опишите ошибку, которую вы нашли:")
-    await state.set_state(FeedbackStates.bug_message)
-
-@router.message(Command("suggest"))
-async def cmd_suggest(message: Message, state: FSMContext):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
-        return
-    
-    await message.answer("Предложите улучшение для бота:")
-    await state.set_state(FeedbackStates.suggestion_message)
-
-class FeedbackStates(StatesGroup):
-    feedback_message = State()
-    bug_message = State()
-    suggestion_message = State()
-
-@router.message(FeedbackStates.feedback_message)
-async def process_feedback(message: Message, state: FSMContext):
-    add_feedback(message.from_user.id, "feedback", message.text)
-    await message.answer("✅ Спасибо за ваш отзыв! Мы рассмотрим его в ближайшее время.")
-    await state.clear()
-
-@router.message(FeedbackStates.bug_message)
-async def process_bug_report(message: Message, state: FSMContext):
-    add_feedback(message.from_user.id, "bug", message.text)
-    await message.answer("✅ Спасибо за сообщение об ошибке! Мы постараемся исправить её как можно скорее.")
-    await state.clear()
-
-@router.message(FeedbackStates.suggestion_message)
-async def process_suggestion(message: Message, state: FSMContext):
-    add_feedback(message.from_user.id, "suggestion", message.text)
-    await message.answer("✅ Спасибо за ваше предложение! Мы рассмотрим его.")
-    await state.clear()
-
-# === СИСТЕМА ПРОМОКОДОВ ===
-@router.message(Command("use_promocode"))
-async def cmd_use_promocode(message: Message, state: FSMContext):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    
-    await message.answer("Введите промокод:")
-    await state.set_state(PromocodeStates.code)
-
-class PromocodeStates(StatesGroup):
-    code = State()
-
-@router.message(PromocodeStates.code)
-async def process_promocode(message: Message, state: FSMContext):
-    code = message.text.strip()
-    success, result = use_promocode(code, message.from_user.id)
-    
-    if success:
-        await message.answer(result)
-    else:
-        await message.answer(result)
-    
-    await state.clear()
-
-# === КОМАНДА ДЛЯ СОЗДАНИЯ ПРОМОКОДОВ (только для админов) ===
-@router.message(Command("create_promocode"))
-async def cmd_create_promocode_full(message: Message, state: FSMContext):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
-        return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
-        return
-    
-    await message.answer("Введите награду за промокод (в восьмерятах):")
-    await state.set_state(AdminPromocodeStates.create_reward)
-
-@router.message(Command("cp"))
-async def cmd_create_promocode_short(message: Message, state: FSMContext):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
-        return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
-        return
-    
-    await message.answer("Введите награду за промокод (в восьмерятах):")
-    await state.set_state(AdminPromocodeStates.create_reward)
-
-@router.message(Command("apply_vosemyata"))
-async def cmd_apply(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-
-    args = message.text.split(maxsplit=1)
+    args = context.args
     if len(args) < 2:
-        await message.answer("Используйте: /apply_vosemyata Причина получения")
-        return
-    reason = args[1]
-
-    # Проверяем, есть ли медиа
-    media_id = None
-    media_type = None
-
-    if message.photo:
-        media_id = message.photo[-1].file_id
-        media_type = "photo"
-    elif message.video:
-        media_id = message.video.file_id
-        media_type = "video"
-    elif message.document:
-        media_id = message.document.file_id
-        media_type = "document"
-    elif message.voice:
-        media_id = message.voice.file_id
-        media_type = "voice"
-    elif message.audio:
-        media_id = message.audio.file_id
-        media_type = "audio"
-    elif message.video_note:
-        media_id = message.video_note.file_id
-        media_type = "video_note"
-
-    update_balance(
-        message.from_user.id,
-        0,
-        message.from_user.username or "unknown",
-        message.from_user.first_name,
-        message.from_user.last_name
-    )
-    add_request(
-        message.from_user.id,
-        message.from_user.username or "unknown",
-        message.from_user.first_name,
-        reason,
-        media_id,
-        media_type
-    )
-    update_daily_stats(requests=1)
-    await message.answer("Ваша заявка отправлена на проверку администратору.")
-
-@router.message(lambda m: m.photo or m.video or m.document or m.voice or m.audio or m.video_note)
-async def handle_media_with_caption(message: Message):
-    if not is_group_chat(message):
-        return
-
-    # Проверяем, есть ли описание (caption)
-    if not message.caption:
-        await message.answer("❌ Отправьте фото/видео с описанием, содержащим команду: /apply_vosemyata Причина получения")
-        return
-
-    # Проверяем, начинается ли описание с команды
-    if not message.caption.startswith("/apply_vosemyata"):
-        await message.answer("❌ Чтобы отправить заявку, начните описание с команды: /apply_vosemyata Причина получения")
-        return
-
-    # Извлекаем причину из описания
-    args = message.caption.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❌ Используйте: /apply_vosemyata Причина получения")
-        return
-    reason = args[1]
-
-    # Получаем тип и ID медиа
-    media_id = None
-    media_type = None
-
-    if message.photo:
-        media_id = message.photo[-1].file_id
-        media_type = "photo"
-    elif message.video:
-        media_id = message.video.file_id
-        media_type = "video"
-    elif message.document:
-        media_id = message.document.file_id
-        media_type = "document"
-    elif message.voice:
-        media_id = message.voice.file_id
-        media_type = "voice"
-    elif message.audio:
-        media_id = message.audio.file_id
-        media_type = "audio"
-    elif message.video_note:
-        media_id = message.video_note.file_id
-        media_type = "video_note"
-
-    update_balance(
-        message.from_user.id,
-        0,
-        message.from_user.username or "unknown",
-        message.from_user.first_name,
-        message.from_user.last_name
-    )
-    add_request(
-        message.from_user.id,
-        message.from_user.username or "unknown",
-        message.from_user.first_name,
-        reason,
-        media_id,
-        media_type
-    )
-    update_daily_stats(requests=1)
-    await message.answer("Ваша заявка отправлена на проверку администратору.")
-
-@router.message(Command("shop"))
-async def cmd_shop(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    items = get_shop_items()
-    if not items:
-        await message.answer("Магазин пуст.")
-        return
-    text = "🛍 Магазин восьмерят:\n\n"
-    for item in items:
-        text += f"{item[0]}. {item[1]} — {item[2]} восьмерят\n"
-        if item[3]:  # description
-            text += f"   {item[3]}\n"
-        text += "\n"
-    text += "Чтобы купить, введите номер товара."
-    await message.answer(text)
-
-@router.message(lambda m: m.text and m.text.isdigit())
-async def handle_number_input(message: Message):
-    if not is_group_chat(message):
+        await update.message.reply_text("Используйте: /black_red <ставка> <red/black>", disable_notification=True)
         return
     try:
-        item_id = int(message.text)
-        success, msg = buy_item_by_id(message.from_user.id, item_id)
-        await message.answer(msg)
-    except Exception:
-        await message.answer("Неверный формат. Введите номер товара из /shop.")
-
-@router.message(Command("top"))
-async def cmd_top(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-    top_users = get_top_users()
-    if not top_users:
-        await message.answer("Нет данных для топа.")
-        return
-    text = "🏆 Топ-10 по восьмерятам:\n\n"
-    for i, user in enumerate(top_users, start=1):
-        text += f"{i}. {user[2] or user[1] or 'unknown'} — {user[3]} восьмерят (Ур. {user[4]})\n"
-    await message.answer(text)
-
-@router.message(Command("transfer"))
-async def cmd_transfer(message: Message):
-    if not is_group_chat(message):
-        await message.answer(MSG_ONLY_IN_GROUP)
-        return
-
-    args = message.text.split()
-    if len(args) != 3:
-        await message.answer("Используйте: /transfer @username количество")
-        return
-
-    target_username = args[1]
-    try:
-        amount = int(args[2])
+        bet = int(args[0])
     except ValueError:
-        await message.answer("Количество должно быть числом.")
+        await update.message.reply_text("Ставка должна быть числом.", disable_notification=True)
         return
+    color = args[1].lower()
+    if color not in ['red', 'black']:
+        await update.message.reply_text("Цвет должен быть 'red' или 'black'.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    if bet <= 0:
+        await update.message.reply_text("Ставка должна быть больше 0.", disable_notification=True)
+        return
+    if user['balance'] < bet:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
+        return
+    win_color = random.choice(['red', 'black'])
+    if win_color == color:
+        win_amount = bet * 2
+        user['balance'] += win_amount
+        msg = f"🎰 Выпал {win_color}. 🎉 Вы выиграли {win_amount} восьмерят!"
+        result = win_amount - bet
+    else:
+        user['balance'] -= bet
+        msg = f"🎰 Выпал {win_color}. 💀 Вы проиграли {bet} восьмерят."
+        result = -bet
+    update_user_data(update.effective_user.id, balance=user['balance'])
+    cursor.execute("INSERT INTO games (user_id, game_type, bet, result) VALUES (?, ?, ?, ?)",
+                   (update.effective_user.id, 'black_red', bet, result))
+    conn.commit()
+    await update.message.reply_text(msg, disable_notification=True)
 
+async def ladder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /ladder <ставка>", disable_notification=True)
+        return
+    try:
+        bet = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Ставка должна быть числом.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    if bet <= 0:
+        await update.message.reply_text("Ставка должна быть больше 0.", disable_notification=True)
+        return
+    if user['balance'] < bet:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
+        return
+    roll = random.randint(1, 6)
+    if roll in [1, 2]:
+        win_amount = bet * 3
+        user['balance'] += win_amount
+        msg = f"🪜 Лесенка: {roll}. 🎉 Вы выиграли {win_amount} восьмерят! (x3)"
+        result = win_amount - bet
+    elif roll in [3, 4, 5]:
+        win_amount = bet * 2
+        user['balance'] += win_amount
+        msg = f"🪜 Лесенка: {roll}. 🎉 Вы выиграли {win_amount} восьмерят! (x2)"
+        result = win_amount - bet
+    else:
+        user['balance'] -= bet
+        msg = f"🪜 Лесенка: {roll}. 💀 Вы проиграли {bet} восьмерят."
+        result = -bet
+    update_user_data(update.effective_user.id, balance=user['balance'])
+    cursor.execute("INSERT INTO games (user_id, game_type, bet, result) VALUES (?, ?, ?, ?)",
+                   (update.effective_user.id, 'ladder', bet, result))
+    conn.commit()
+    await update.message.reply_text(msg, disable_notification=True)
+
+async def rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    msg = f"🏆 Ваш уровень: {user['level']}\n⚡ Опыт: {user['exp']}"
+    await update.message.reply_text(msg, disable_notification=True)
+
+# --- РАБОТА ---
+async def work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    now = datetime.now().timestamp()
+    if now - user['last_work_time'] < WORK_COOLDOWN:
+        remaining = WORK_COOLDOWN - (now - user['last_work_time'])
+        minutes, seconds = divmod(int(remaining), 60)
+        await update.message.reply_text(f"⏰ Подождите еще {minutes} мин {seconds} сек.", disable_notification=True)
+        return
+    earnings = random.randint(1, 5)
+    user['balance'] += earnings
+    update_user_data(update.effective_user.id, balance=user['balance'], last_work_time=now)
+    add_exp(update.effective_user.id, 1)
+    await update.message.reply_text(f"💼 Вы заработали {earnings} восьмерят!", disable_notification=True)
+
+async def work2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    now = datetime.now().timestamp()
+    if now - user['last_work2_time'] < WORK2_COOLDOWN:
+        remaining = WORK2_COOLDOWN - (now - user['last_work2_time'])
+        minutes, seconds = divmod(int(remaining), 60)
+        await update.message.reply_text(f"⏰ Подождите еще {minutes} мин {seconds} сек.", disable_notification=True)
+        return
+    earnings = random.randint(3, 8)
+    user['balance'] += earnings
+    update_user_data(update.effective_user.id, balance=user['balance'], last_work2_time=now)
+    add_exp(update.effective_user.id, 2)
+    await update.message.reply_text(f"💼 Вы заработали {earnings} восьмерят!", disable_notification=True)
+
+async def work3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    now = datetime.now().timestamp()
+    if now - user['last_work3_time'] < WORK3_COOLDOWN:
+        remaining = WORK3_COOLDOWN - (now - user['last_work3_time'])
+        minutes, seconds = divmod(int(remaining), 60)
+        await update.message.reply_text(f"⏰ Подождите еще {minutes} мин {seconds} сек.", disable_notification=True)
+        return
+    earnings = random.randint(5, 15)
+    user['balance'] += earnings
+    update_user_data(update.effective_user.id, balance=user['balance'], last_work3_time=now)
+    add_exp(update.effective_user.id, 3)
+    await update.message.reply_text(f"💼 Вы заработали {earnings} восьмерят!", disable_notification=True)
+
+async def work4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    now = datetime.now().timestamp()
+    if now - user['last_work4_time'] < WORK4_COOLDOWN:
+        remaining = WORK4_COOLDOWN - (now - user['last_work4_time'])
+        minutes, seconds = divmod(int(remaining), 60)
+        await update.message.reply_text(f"⏰ Подождите еще {minutes} мин {seconds} сек.", disable_notification=True)
+        return
+    earnings = random.randint(10, 25)
+    user['balance'] += earnings
+    update_user_data(update.effective_user.id, balance=user['balance'], last_work4_time=now)
+    add_exp(update.effective_user.id, 5)
+    await update.message.reply_text(f"💼 Вы заработали {earnings} восьмерят!", disable_notification=True)
+
+# --- ЕЖЕНЕДЕЛЬНАЯ НАГРАДА ---
+async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    today = datetime.now().strftime('%Y-%m-%d')
+    if user['weekly_claimed_date'] == today:
+        await update.message.reply_text("❌ Вы уже забрали недельную награду сегодня.", disable_notification=True)
+        return
+    reward = WEEKLY_REWARD_BASE + (user['level'] * WEEKLY_REWARD_PER_LEVEL)
+    user['balance'] += reward
+    update_user_data(update.effective_user.id, balance=user['balance'], weekly_claimed_date=today)
+    await update.message.reply_text(f"🎁 Вы получили {reward} восьмерят за неделю!", disable_notification=True)
+
+# --- БАНК ---
+async def bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    msg = f"""
+🏦 Баланс: {user['balance']} восьмерят
+💰 В банке: {user['bank_balance']} восьмерят
+📈 Проценты: {int(user['bank_balance'] * DAILY_BANK_INTEREST_RATE)} в день
+"""
+    keyboard = [
+        [InlineKeyboardButton("💰 Положить", callback_data="bank_deposit_prompt"),
+         InlineKeyboardButton("💸 Снять", callback_data="bank_withdraw_prompt")],
+        [InlineKeyboardButton("📊 Инфо", callback_data="bank_info")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(msg, reply_markup=reply_markup, disable_notification=True)
+
+async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /deposit <сумма>", disable_notification=True)
+        return
+    try:
+        amount = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Сумма должна быть числом.", disable_notification=True)
+        return
+    user = get_user_data(update.effective_user.id, update.effective_user)
     if amount <= 0:
-        await message.answer("Переводить можно только положительное количество.")
+        await update.message.reply_text("Сумма должна быть больше 0.", disable_notification=True)
         return
-
-    sender_id = message.from_user.id
-    sender_balance = get_user_balance(sender_id)
-
-    if sender_balance < amount:
-        await message.answer("❌ Недостаточно восьмерят для перевода.")
+    if user['balance'] < amount:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
         return
+    user['balance'] -= amount
+    user['bank_balance'] += amount
+    update_user_data(update.effective_user.id, balance=user['balance'], bank_balance=user['bank_balance'])
+    await update.message.reply_text(f"✅ Вы положили {amount} восьмерят в банк.", disable_notification=True)
 
-    # === ПРОВЕРКА ЛИМИТА: 3 перевода в день ===
-    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username[1:],))
-    receiver = cursor.fetchone()
-
-    if not receiver:
-        await message.answer(f"❌ Пользователь {target_username} не найден. Убедитесь, что он уже писал боту.")
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
         return
-
-    receiver_id, = receiver
-
-    if receiver_id == sender_id:
-        await message.answer("❌ Нельзя перевести самому себе.")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /withdraw <сумма>", disable_notification=True)
         return
-
-    # Проверяем лимит
-    count_today = get_transfer_count_today(sender_id, receiver_id)
-    if count_today >= 3:
-        await message.answer("❌ Вы уже перевели 3 раза этому пользователю сегодня.")
-        return
-
-    # Выполняем перевод
-    update_balance(sender_id, -amount, message.from_user.username)
-    update_balance(receiver_id, amount, target_username[1:])
-
-    # === СОХРАНЯЕМ ПЕРЕВОД В ИСТОРИЮ ===
-    add_transfer(sender_id, receiver_id, amount)
-
-    # Уведомляем обоих
     try:
-        await bot.send_message(sender_id, f"✅ Вы перевели {amount} восьмерят пользователю {target_username}.")
-    except Exception:
-        pass
-
-    try:
-        await bot.send_message(receiver_id, f"💰 Вам перевели {amount} восьмерят от @{message.from_user.username}!")
-    except Exception:
-        pass
-
-    await message.answer(f"✅ Перевод выполнен: @{message.from_user.username} → {target_username}: {amount} восьмерят.")
-
-# === КОЛБЭКИ БАНКА ===
-@router.callback_query(lambda c: c.data == "bank_deposit")
-async def bank_deposit_prompt(call: CallbackQuery, state: FSMContext):
-    if not is_group_chat(call.message):
-        await call.answer("❌ Эта функция доступна только в группе.", show_alert=True)
-        return
-    await call.message.answer("Введите сумму для внесения в банк:")
-    await state.set_state(BankStates.deposit_amount)
-
-@router.callback_query(lambda c: c.data == "bank_withdraw")
-async def bank_withdraw_prompt(call: CallbackQuery, state: FSMContext):
-    if not is_group_chat(call.message):
-        await call.answer("❌ Эта функция доступна только в группе.", show_alert=True)
-        return
-    await call.message.answer("Введите сумму для снятия из банка:")
-    await state.set_state(BankStates.withdraw_amount)
-
-@router.callback_query(lambda c: c.data == "bank_info")
-async def bank_info(call: CallbackQuery):
-    balance = get_user_balance(call.from_user.id)
-    bank_balance = get_user_bank_balance(call.from_user.id)
-    await call.message.answer(f"🏦 Информация о банке:\n"
-                              f"Ваш баланс: {balance} восьмерят\n"
-                              f"В банке: {bank_balance} восьмерят\n"
-                              f"Проценты: 1% в день от суммы в банке")
-
-class BankStates(StatesGroup):
-    deposit_amount = State()
-    withdraw_amount = State()
-
-@router.message(BankStates.deposit_amount)
-async def process_deposit(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        if amount <= 0:
-            await message.answer("Сумма должна быть положительной.")
-            return
-        
-        user_balance = get_user_balance(message.from_user.id)
-        if user_balance < amount:
-            await message.answer("❌ Недостаточно восьмерят для внесения.")
-            return
-        
-        update_balance(message.from_user.id, -amount, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-        cursor.execute("UPDATE users SET bank_balance = bank_balance + ? WHERE user_id = ?", (amount, message.from_user.id))
-        conn.commit()
-        
-        await message.answer(f"✅ Внесено {amount} восьмерят в банк.")
+        amount = int(args[0])
     except ValueError:
-        await message.answer("Введите корректное число.")
-    finally:
-        await state.clear()
-
-@router.message(BankStates.withdraw_amount)
-async def process_withdraw(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        if amount <= 0:
-            await message.answer("Сумма должна быть положительной.")
-            return
-        
-        bank_balance = get_user_bank_balance(message.from_user.id)
-        if bank_balance < amount:
-            await message.answer("❌ Недостаточно восьмерят в банке.")
-            return
-        
-        update_balance(message.from_user.id, amount, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-        cursor.execute("UPDATE users SET bank_balance = bank_balance - ? WHERE user_id = ?", (amount, message.from_user.id))
-        conn.commit()
-        
-        await message.answer(f"✅ Снято {amount} восьмерят из банка.")
-    except ValueError:
-        await message.answer("Введите корректное число.")
-    finally:
-        await state.clear()
-
-# === АДМИН-КОМАНДЫ (работают только в ЛС) ===
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+        await update.message.reply_text("Сумма должна быть числом.", disable_notification=True)
         return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    if amount <= 0:
+        await update.message.reply_text("Сумма должна быть больше 0.", disable_notification=True)
         return
-
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Заявки", callback_data="admin_requests")
-    builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
-    builder.button(text="🏷️ Промокоды", callback_data="admin_promocodes")
-    builder.button(text="🛒 Магазин", callback_data="admin_shop")
-    builder.button(text="👥 Топ", callback_data="admin_top")
-    builder.button(text="📜 История", callback_data="admin_history")
-    builder.button(text="📊 Статистика", callback_data="admin_stats")
-    builder.button(text="💰 Выдать/списать", callback_data="admin_adjust_menu")
-    await message.answer("Админ-панель восьмерят:", reply_markup=builder.as_markup())
-
-@router.message(Command("adjust"))
-async def cmd_adjust(message: Message):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+    if user['bank_balance'] < amount:
+        await update.message.reply_text("❌ Недостаточно восьмерят в банке.", disable_notification=True)
         return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+    user['balance'] += amount
+    user['bank_balance'] -= amount
+    update_user_data(update.effective_user.id, balance=user['balance'], bank_balance=user['bank_balance'])
+    await update.message.reply_text(f"✅ Вы сняли {amount} восьмерят из банка.", disable_notification=True)
+
+# --- ПЕРЕВОДЫ ---
+async def transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Перевод возможен только в группе.", disable_notification=True)
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Используйте: /transfer @username <сумма>", disable_notification=True)
         return
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            raise ValueError()
-        user_id = int(parts[1])
-        amount = int(parts[2])
-
-        # Проверяем, существует ли пользователь
-        cursor.execute("SELECT username, first_name FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            await message.answer(f"❌ Пользователь с ID {user_id} не найден. Убедитесь, что он хотя бы раз написал боту.")
-            return
-
-        username = user[0]
-        first_name = user[1]
-        update_balance(user_id, amount, username, first_name)
-        action = "начислено" if amount > 0 else "снято"
-        await message.answer(f"✅ {abs(amount)} восьмерят {action} пользователю {first_name or username} (ID: {user_id}).")
-        try:
-            await bot.send_message(user_id, f"🔔 Админ {action} {abs(amount)} восьмерят. Новое значение: {get_user_balance(user_id)}")
-        except Exception:
-            pass
+        target_username = args[0].replace('@', '')
+        amount = int(args[1])
     except ValueError:
-        await message.answer("Используйте: /adjust USER_ID КОЛИЧЕСТВО\n(например: /adjust 123456789 8)")
-    except Exception as e:
-        logging.error(f"Ошибка в /adjust: {e}")
-        await message.answer("❌ Произошла ошибка. Проверьте логи.")
-
-@router.message(Command("profile"))
-async def cmd_profile_admin(message: Message):
-    if not is_private_chat(message):
-        await message.answer(MSG_ONLY_IN_PRIVATE)
+        await update.message.reply_text("Сумма должна быть числом.", disable_notification=True)
         return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
+    if amount <= 0:
+        await update.message.reply_text("Сумма должна быть больше 0.", disable_notification=True)
         return
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Используйте: /profile USER_ID")
+    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username,))
+    target_row = cursor.fetchone()
+    if not target_row:
+        await update.message.reply_text("❌ Пользователь не найден.", disable_notification=True)
         return
-    try:
-        user_id = int(args[1])
-        balance = get_user_balance(user_id)
-        cursor.execute("SELECT username, first_name, last_name FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            await message.answer("Пользователь не найден.")
+    target_id = target_row[0]
+    sender = get_user_data(update.effective_user.id, update.effective_user)
+    if sender['balance'] < amount:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
+        return
+    transfers_today = sender['transfers_today']
+    if str(target_id) in transfers_today:
+        if transfers_today[str(target_id)] >= TRANSFER_LIMIT_PER_USER:
+            await update.message.reply_text(f"❌ Вы уже перевели 3 раза этому пользователю сегодня.", disable_notification=True)
             return
-        username, first_name, last_name = user
-        full_name = f"{first_name or ''} {last_name or ''}".strip() or username
-
-        from aiogram.utils.keyboard import InlineKeyboardBuilder
-        builder = InlineKeyboardBuilder()
-        builder.button(text="💰 Перевести", callback_data=f"transfer_to_{user_id}")
-        builder.button(text="📊 Статистика", callback_data=f"stats_user_{user_id}")
-        builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-        
-        cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ?", (user_id,))
-        total_requests = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM requests WHERE user_id = ? AND status = 'approved'", (user_id,))
-        approved = cursor.fetchone()[0]
-        await message.answer(
-            f"👤 Профиль {full_name} (ID: {user_id})\n"
-            f"💰 Баланс: {balance} восьмерят\n"
-            f"📊 Заявок всего: {total_requests}\n"
-            f"✅ Одобрено: {approved}",
-            reply_markup=builder.as_markup()
-        )
-    except ValueError:
-        await message.answer("Неверный ID.")
-
-# === КНОПКА "ПЕРЕВЕСТИ" В ПРОФИЛЕ ===
-@router.callback_query(lambda c: c.data.startswith("transfer_to_"))
-async def transfer_to_user(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-
-    target_user_id = int(call.data.split("_")[2])
-    await call.message.edit_text(f"Введите сумму для перевода пользователю с ID {target_user_id}:\n\nПример: /adjust {target_user_id} 8")
-    await call.answer()
-
-# === АДМИН-ПАНЕЛЬ ПРОМОКОДОВ ===
-@router.callback_query(lambda c: c.data == "admin_promocodes")
-async def admin_promocodes(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    promocodes = get_all_promocodes()
-    if not promocodes:
-        text = "🏷️ Нет созданных промокодов."
+        transfers_today[str(target_id)] += 1
     else:
-        text = "🏷️ Все промокоды:\n\n"
-        for p in promocodes:
-            _, code, reward, uses_limit, uses_count, creator_id, created_at, expires_at = p
-            status = f" ({uses_count}/{uses_limit})" if uses_limit != 0 else ""
-            expires = f" (до {expires_at})" if expires_at else ""
-            text += f"• `{code}`: {reward} восьмерят{status}{expires}\n"
-    
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Создать", callback_data="create_promocode")
-    builder.button(text="🗑️ Удалить", callback_data="delete_promocode")
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    
-    await call.message.edit_text(text, reply_markup=builder.as_markup())
-    await call.answer()
+        transfers_today[str(target_id)] = 1
+    sender['balance'] -= amount
+    update_user_data(update.effective_user.id, balance=sender['balance'], transfers_today=json.dumps(transfers_today))
+    target_user = get_user_data(target_id)
+    target_user['balance'] += amount
+    update_user_data(target_id, balance=target_user['balance'])
+    await update.message.reply_text(f"✅ Вы перевели {amount} восьмерят пользователю @{target_username}.", disable_notification=True)
 
-@router.callback_query(lambda c: c.data == "create_promocode")
-async def create_promocode_prompt(call: CallbackQuery, state: FSMContext):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+async def gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Подарок возможен только в группе.", disable_notification=True)
         return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("Используйте: /gift @username <сумма> <сообщение>", disable_notification=True)
         return
-    
-    await call.message.answer("Введите награду за промокод (в восьмерятах):")
-    await state.set_state(AdminPromocodeStates.create_reward)
-
-@router.callback_query(lambda c: c.data == "delete_promocode")
-async def delete_promocode_prompt(call: CallbackQuery, state: FSMContext):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    await call.message.answer("Введите промокод для удаления:")
-    await state.set_state(AdminPromocodeStates.delete_code)
-
-class AdminPromocodeStates(StatesGroup):
-    create_reward = State()
-    create_uses = State()
-    create_expires = State()
-    delete_code = State()
-
-@router.message(AdminPromocodeStates.create_reward)
-async def create_promocode_reward(message: Message, state: FSMContext):
     try:
-        reward = int(message.text)
-        if reward <= 0:
-            await message.answer("Награда должна быть положительной.")
-            return
-        await state.update_data(reward=reward)
-        await message.answer("Введите лимит использований (0 для бесконечного):")
-        await state.set_state(AdminPromocodeStates.create_uses)
+        target_username = args[0].replace('@', '')
+        amount = int(args[1])
+        message = ' '.join(args[2:])
     except ValueError:
-        await message.answer("Введите корректное число.")
+        await update.message.reply_text("Сумма должна быть числом.", disable_notification=True)
+        return
+    if amount <= 0:
+        await update.message.reply_text("Сумма должна быть больше 0.", disable_notification=True)
+        return
+    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username,))
+    target_row = cursor.fetchone()
+    if not target_row:
+        await update.message.reply_text("❌ Пользователь не найден.", disable_notification=True)
+        return
+    target_id = target_row[0]
+    sender = get_user_data(update.effective_user.id, update.effective_user)
+    if sender['balance'] < amount:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
+        return
+    sender['balance'] -= amount
+    update_user_data(update.effective_user.id, balance=sender['balance'])
+    target_user = get_user_data(target_id)
+    target_user['balance'] += amount
+    update_user_data(target_id, balance=target_user['balance'])
+    await update.message.reply_text(f"🎁 Вы подарили {amount} восьмерят пользователю @{target_username} с сообщением: {message}", disable_notification=True)
 
-@router.message(AdminPromocodeStates.create_uses)
-async def create_promocode_uses(message: Message, state: FSMContext):
+# --- ТОП, МАГАЗИН, ПРОФИЛЬ ---
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute("SELECT username, balance, level FROM users ORDER BY balance DESC LIMIT 10")
+    rows = cursor.fetchall()
+    top_list = "\n".join([f"{i+1}. @{row[0] or 'noname'} — {row[1]} (Ур. {row[2]})" for i, row in enumerate(rows)])
+    await update.message.reply_text(f"🏆 Топ-10:\n{top_list or 'Пусто'}", disable_notification=True)
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cursor.execute("SELECT item_id, name, price, description FROM shop_items")
+    items = cursor.fetchall()
+    if not items:
+        await update.message.reply_text("🛍️ Магазин пуст.", disable_notification=True)
+        return
+    shop_list = "\n".join([f"ID: {item[0]} | {item[1]} — {item[2]} восьмерят\n{item[3] or ''}" for item in items])
+    await update.message.reply_text(f"🛍️ Магазин:\n{shop_list}", disable_notification=True)
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /buy <ID_товара>", disable_notification=True)
+        return
     try:
-        uses = int(message.text)
-        if uses < 0:
-            await message.answer("Лимит должен быть неотрицательным.")
-            return
-        await state.update_data(uses=uses)
-        await message.answer("Введите срок действия в днях (0 для бессрочного, макс. 365):")
-        await state.set_state(AdminPromocodeStates.create_expires)
+        item_id = int(args[0])
     except ValueError:
-        await message.answer("Введите корректное число.")
+        await update.message.reply_text("ID должен быть числом.", disable_notification=True)
+        return
+    cursor.execute("SELECT name, price FROM shop_items WHERE item_id = ?", (item_id,))
+    item = cursor.fetchone()
+    if not item:
+        await update.message.reply_text("❌ Товар не найден.", disable_notification=True)
+        return
+    name, price = item
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    if user['balance'] < price:
+        await update.message.reply_text("❌ Недостаточно восьмерят.", disable_notification=True)
+        return
+    user['balance'] -= price
+    update_user_data(update.effective_user.id, balance=user['balance'])
+    await update.message.reply_text(f"✅ Вы купили {name} за {price} восьмерят.", disable_notification=True)
 
-@router.message(AdminPromocodeStates.create_expires)
-async def create_promocode_expires(message: Message, state: FSMContext):
-    try:
-        days = int(message.text)
-        if days < 0 or days > 365:
-            await message.answer("Введите число от 0 до 365.")
-            return
-        
-        data = await state.get_data()
-        reward = data['reward']
-        uses = data['uses']
-        
-        expires_at = None
-        if days > 0:
-            expires_at = (datetime.now() + timedelta(days=days)).isoformat()
-        
-        code = create_promocode(reward, uses if uses > 0 else 999999, expires_at)
-        cursor.execute("UPDATE promocodes SET creator_id = ? WHERE code = ?", (message.from_user.id, code))
-        conn.commit()
-        
-        await message.answer(f"✅ Промокод создан:\n\n`{code}`\nНаграда: {reward} восьмерят\nЛимит: {uses if uses > 0 else 'бесконечный'}\nСрок: {'бессрочный' if days == 0 else f'{days} дней'}")
-    except ValueError:
-        await message.answer("Введите корректное число.")
-    finally:
-        await state.clear()
-
-@router.message(AdminPromocodeStates.delete_code)
-async def delete_promocode_process(message: Message, state: FSMContext):
-    code = message.text.strip()
-    promocode = get_promocode_by_code(code)
-    
-    if not promocode:
-        await message.answer("❌ Промокод не найден.")
-    else:
-        delete_promocode(code)
-        await message.answer(f"✅ Промокод `{code}` удалён.")
-    
-    await state.clear()
-
-# === ОСТАЛЬНЫЕ КОЛБЭКИ ===
-@router.callback_query(lambda c: c.data == "back_to_main")
-async def back_to_main_menu(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+async def use_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Использовать промокод можно только в личке.", disable_notification=True)
         return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /use_promocode <код>", disable_notification=True)
         return
-    
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Заявки", callback_data="admin_requests")
-    builder.button(text="💬 Обратная связь", callback_data="admin_feedback")
-    builder.button(text="🏷️ Промокоды", callback_data="admin_promocodes")
-    builder.button(text="🛒 Магазин", callback_data="admin_shop")
-    builder.button(text="👥 Топ", callback_data="admin_top")
-    builder.button(text="📜 История", callback_data="admin_history")
-    builder.button(text="📊 Статистика", callback_data="admin_stats")
-    builder.button(text="💰 Выдать/списать", callback_data="admin_adjust_menu")
-    
-    await call.message.edit_text("Админ-панель восьмерят:", reply_markup=builder.as_markup())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "admin_requests")
-async def admin_requests(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+    code = args[0]
+    cursor.execute("SELECT reward, uses_limit, uses_count, expires_at FROM promocodes WHERE code = ?", (code,))
+    result = cursor.fetchone()
+    if not result:
+        await update.message.reply_text("❌ Неверный промокод.", disable_notification=True)
         return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
+    reward, uses_limit, uses_count, expires_at = result
+    if expires_at and datetime.fromisoformat(expires_at) < datetime.now():
+        await update.message.reply_text("❌ Срок действия промокода истёк.", disable_notification=True)
         return
-    requests = get_pending_requests()
-    if not requests:
-        await call.message.edit_text("Нет новых заявок.", reply_markup=back_to_main())
-        await call.answer()
+    if uses_count >= uses_limit:
+        await update.message.reply_text("❌ Лимит использований промокода исчерпан.", disable_notification=True)
         return
-
-    text = "📋 Новые заявки:\n\n"
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    for r in requests:
-        text += f"ID {r[0]} от {r[3] or r[2]}: {r[4]}\n"
-        builder.button(text=f"✅ Одобрить #{r[0]}", callback_data=f"approve_{r[0]}")
-        builder.button(text=f"❌ Отклонить #{r[0]}", callback_data=f"decline_{r[0]}")
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    
-    await call.message.edit_text(text, reply_markup=builder.as_markup())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "admin_feedback")
-async def admin_feedback(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
+    user_id = update.effective_user.id
+    cursor.execute("SELECT 1 FROM used_promocodes WHERE user_id = ? AND code = ?", (user_id, code))
+    if cursor.fetchone():
+        await update.message.reply_text("❌ Вы уже использовали этот промокод.", disable_notification=True)
         return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    feedbacks = get_pending_feedback()
-    if not feedbacks:
-        await call.message.edit_text("Нет новых сообщений обратной связи.", reply_markup=back_to_main())
-        await call.answer()
-        return
-
-    text = "💬 Новые сообщения обратной связи:\n\n"
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    for f in feedbacks:
-        text += f"ID {f[0]} от {f[1]} ({f[2]}): {f[3]}\n\n"
-        builder.button(text=f"✅ Отметить #{f[0]}", callback_data=f"feedback_done_{f[0]}")
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    
-    await call.message.edit_text(text, reply_markup=builder.as_markup())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data.startswith("feedback_done_"))
-async def feedback_done(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    feedback_id = int(call.data.split("_")[2])
-    cursor.execute("UPDATE feedback SET status = 'done' WHERE id = ?", (feedback_id,))
+    user = get_user_data(user_id, update.effective_user)
+    user['balance'] += reward
+    update_user_data(user_id, balance=user['balance'])
+    cursor.execute("UPDATE promocodes SET uses_count = uses_count + 1 WHERE code = ?", (code,))
+    cursor.execute("INSERT INTO used_promocodes (user_id, code) VALUES (?, ?)", (user_id, code))
     conn.commit()
-    
-    await call.answer("✅ Сообщение отмечено как обработанное.")
-    await admin_feedback(call)
+    await update.message.reply_text(f"🎉 Вы получили {reward} восьмерят по промокоду!", disable_notification=True)
 
-# === Отправка медиа админу при одобрении/отклонении ===
-async def send_media_to_admin(req_id, user_id, reason, media_id, media_type, admin_id, action):
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    msg = f"""
+👤 Профиль:
+Имя: {update.effective_user.first_name or 'Не указано'}
+Username: @{user['username'] or 'не задан'}
+💰 Баланс: {user['balance']}
+🏆 Уровень: {user['level']}
+📝 Описание: {user['profile_description']}
+🎨 Скин: {user['profile_skin']}
+"""
+    await update.message.reply_text(msg, disable_notification=True)
+
+async def setskin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /setskin <название_скина>", disable_notification=True)
+        return
+    skin = args[0]
+    update_user_data(update.effective_user.id, profile_skin=skin)
+    await update.message.reply_text(f"🎨 Скин изменён на '{skin}'.", disable_notification=True)
+
+async def setdesc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /setdesc <описание>", disable_notification=True)
+        return
+    desc = ' '.join(args)
+    update_user_data(update.effective_user.id, profile_description=desc)
+    await update.message.reply_text(f"📝 Описание установлено: {desc}", disable_notification=True)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_data(update.effective_user.id, update.effective_user)
+    msg = f"""
+📊 Ваша статистика:
+Уровень: {user['level']}
+Опыт: {user['exp']}
+Баланс: {user['balance']}
+В банке: {user['bank_balance']}
+"""
+    await update.message.reply_text(msg, disable_notification=True)
+
+# --- ОБРАТНАЯ СВЯЗЬ ---
+async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Отзыв можно отправить только в личке.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /feedback <сообщение>", disable_notification=True)
+        return
+    message = ' '.join(args)
+    cursor.execute("INSERT INTO feedback (user_id, type, message) VALUES (?, 'feedback', ?)", (update.effective_user.id, message))
+    conn.commit()
+    await update.message.reply_text("✅ Спасибо за ваш отзыв!", disable_notification=True)
+
+async def bug_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Сообщение об ошибке можно отправить только в личке.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /bug_report <сообщение>", disable_notification=True)
+        return
+    message = ' '.join(args)
+    cursor.execute("INSERT INTO feedback (user_id, type, message) VALUES (?, 'bug', ?)", (update.effective_user.id, message))
+    conn.commit()
+    await update.message.reply_text("✅ Спасибо за сообщение об ошибке!", disable_notification=True)
+
+async def suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("❌ Предложение можно отправить только в личке.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /suggest <сообщение>", disable_notification=True)
+        return
+    message = ' '.join(args)
+    cursor.execute("INSERT INTO feedback (user_id, type, message) VALUES (?, 'suggestion', ?)", (update.effective_user.id, message))
+    conn.commit()
+    await update.message.reply_text("✅ Спасибо за ваше предложение!", disable_notification=True)
+
+# --- АДМИН-ПАНЕЛЬ ---
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    keyboard = [
+        [InlineKeyboardButton("📋 Заявки", callback_data="admin_applications")],
+        [InlineKeyboardButton("🏷️ Промокоды", callback_data="admin_promocodes")],
+        [InlineKeyboardButton("🛍️ Магазин", callback_data="admin_shop")],
+        [InlineKeyboardButton("💰 Выдать/списать", callback_data="admin_adjust_prompt")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👑 Админ-панель:", reply_markup=reply_markup, disable_notification=True)
+
+# --- FSM: Промокоды ---
+async def create_promocode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    await update.message.reply_text("Введите награду за промокод:", disable_notification=True)
+    return CREATE_PROMO_REWARD
+
+async def create_promocode_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Получаем юзернейм
-        user = await bot.get_chat(user_id)
-        username = user.username or "unknown"
-        first_name = user.first_name or "unknown"
-
-        caption = f"Заявка #{req_id} от {first_name} (@{username})\nПричина: {reason}\nДействие: {action}"
-
-        if media_id and media_type:
-            if media_type == "photo":
-                await bot.send_photo(chat_id=admin_id, photo=media_id, caption=caption)
-            elif media_type == "video":
-                await bot.send_video(chat_id=admin_id, video=media_id, caption=caption)
-            elif media_type == "document":
-                await bot.send_document(chat_id=admin_id, document=media_id, caption=caption)
-            elif media_type == "voice":
-                await bot.send_voice(chat_id=admin_id, voice=media_id, caption=caption)
-            elif media_type == "audio":
-                await bot.send_audio(chat_id=admin_id, audio=media_id, caption=caption)
-            elif media_type == "video_note":
-                await bot.send_video_note(chat_id=admin_id, video_note=media_id)
-        else:
-            await bot.send_message(chat_id=admin_id, text=f"Заявка #{req_id} от {first_name} (@{username})\nПричина: {reason}\nДействие: {action}")
-    except Exception as e:
-        logging.error(f"Ошибка при отправке медиа админу {admin_id}: {e}")
-
-@router.callback_query(lambda c: c.data.startswith("approve_"))
-async def approve_request(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
-    row = cursor.fetchone()
-    if not row:
-        await call.answer("Заявка не найдена.", show_alert=True)
-        return
-    user_id, reason, media_id, media_type = row
-
-    update_request_status(req_id, 'approved', call.from_user.id)
-    update_daily_stats(approved=1)
-
-    try:
-        await bot.send_message(user_id, f"✅ Ваша заявка #{req_id} одобрена! 8 восьмерят зачислено.")
-    except Exception:
-        pass
-
-    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "✅ Одобрено")
-    await admin_requests(call)
-
-@router.callback_query(lambda c: c.data.startswith("decline_"))
-async def decline_request(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    req_id = int(call.data.split("_")[1])
-    cursor.execute("SELECT user_id, reason, media_id, media_type FROM requests WHERE id = ?", (req_id,))
-    row = cursor.fetchone()
-    if not row:
-        await call.answer("Заявка не найдена.", show_alert=True)
-        return
-    user_id, reason, media_id, media_type = row
-
-    update_request_status(req_id, 'declined', call.from_user.id)
-
-    try:
-        await bot.send_message(user_id, f"❌ Ваша заявка #{req_id} отклонена администратором.")
-    except Exception:
-        pass
-
-    await send_media_to_admin(req_id, user_id, reason, media_id, media_type, call.from_user.id, "❌ Отклонено")
-    await admin_requests(call)
-
-@router.callback_query(lambda c: c.data == "admin_shop")
-async def admin_shop(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    items = get_shop_items()
-    text = "🛒 Товары в магазине:\n\n"
-    for item in items:
-        text += f"{item[0]}. {item[1]} — {item[2]} восьмерят\n"
-        if item[3]:  # description
-            text += f"   {item[3]}\n"
-        text += "\n"
-    text += "Чтобы добавить товар, нажмите кнопку ниже."
-    
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить товар", callback_data="admin_add_item_prompt")
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    
-    await call.message.edit_text(text, reply_markup=builder.as_markup())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "admin_add_item_prompt")
-async def admin_add_item_prompt(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите название, цену и описание товара в формате:\n\nНазвание Цена Описание")
-    await call.answer()
-
-@router.message(lambda m: m.text and re.match(r"^[^0-9].+ \d+ .+$", m.text))
-async def handle_add_item(message: Message):
-    if not is_private_chat(message):
-        return
-    if not is_admin(message.from_user.id):
-        await message.answer(MSG_ACCESS_DENIED)
-        return
-    try:
-        parts = message.text.rsplit(" ", 2)
-        name = parts[0].strip()
-        price = int(parts[1])
-        description = parts[2]
-        add_item_to_shop(name, price, description)
-        await message.answer(f"Товар '{name}' добавлен в магазин за {price} восьмерят.\nОписание: {description}")
+        reward = int(update.message.text)
+        if reward <= 0:
+            await update.message.reply_text("Награда должна быть положительной. Попробуйте снова.", disable_notification=True)
+            return CREATE_PROMO_REWARD
+        context.user_data['promo_reward'] = reward
+        await update.message.reply_text("Введите лимит использований (0 для бесконечного):", disable_notification=True)
+        return CREATE_PROMO_USES
     except ValueError:
-        await message.answer("Неверный формат. Введите: Название Цена Описание")
-    except Exception:
-        await message.answer("Произошла ошибка при добавлении товара.")
+        await update.message.reply_text("Это не число. Попробуйте снова.", disable_notification=True)
+        return CREATE_PROMO_REWARD
 
-@router.callback_query(lambda c: c.data == "admin_top")
-async def admin_top(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    top_users = get_top_users()
-    text = "🏆 Топ-10 пользователей:\n\n"
-    for i, user in enumerate(top_users, start=1):
-        text += f"{i}. {user[2] or user[1] or 'unknown'} — {user[3]} восьмерят (Ур. {user[4]})\n"
-    await call.message.edit_text(text, reply_markup=back_to_main())
-    await call.answer()
+async def create_promocode_uses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uses = int(update.message.text)
+        if uses < 0:
+            await update.message.reply_text("Лимит не может быть отрицательным. Попробуйте снова.", disable_notification=True)
+            return CREATE_PROMO_USES
+        context.user_data['promo_uses'] = uses if uses > 0 else 999999 # 999999 как "бесконечный"
+        await update.message.reply_text("Введите срок действия в днях (0 для бессрочного):", disable_notification=True)
+        return CREATE_PROMO_EXPIRES
+    except ValueError:
+        await update.message.reply_text("Это не число. Попробуйте снова.", disable_notification=True)
+        return CREATE_PROMO_USES
 
-@router.callback_query(lambda c: c.data == "admin_history")
-async def admin_history(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    history = get_request_history()
-    if not history:
-        await call.message.edit_text("Нет истории заявок.", reply_markup=back_to_main())
-        return
-    text = "📜 История заявок (последние 20):\n\n"
-    for h in history:
-        text += f"ID {h[0]} от @{h[2]}: {h[3]} — {h[4]}\n"
-    await call.message.edit_text(text, reply_markup=back_to_main())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "admin_stats")
-async def admin_stats(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    stats = get_daily_stats()
-    text = f"📊 Статистика за сегодня ({stats[0]}):\n\n"
-    text += f"Заявок: {stats[2]}\n"
-    text += f"Одобрено: {stats[3]}\n"
-    text += f"Переводов: {stats[4]}\n"
-    text += f"Всего переведено: {stats[5]} восьмерят"
-    
-    await call.message.edit_text(text, reply_markup=back_to_main())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "admin_adjust_menu")
-async def admin_adjust_menu(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    builder = InlineKeyboardBuilder()
-    builder.button(text="+8", callback_data="adjust_amount_8")
-    builder.button(text="+40", callback_data="adjust_amount_40")
-    builder.button(text="-8", callback_data="adjust_amount_neg_8")
-    builder.button(text="-40", callback_data="adjust_amount_neg_40")
-    builder.button(text="Другое", callback_data="adjust_custom")
-    builder.button(text="👤 Показать профиль", callback_data="show_profile")
-    builder.button(text=BACK_BUTTON, callback_data="back_to_main")
-    
-    await call.message.edit_text("Выберите действие:", reply_markup=builder.as_markup())
-    await call.answer()
-
-@router.callback_query(lambda c: c.data.startswith("adjust_amount_"))
-async def admin_adjust_amount(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    amount_str = call.data.split("_")[2]
-    if amount_str.startswith("neg_"):
-        amount = -int(amount_str[4:])
-    else:
-        amount = int(amount_str)
-
-    await call.message.edit_text(f"Вы выбрали: {'+' if amount > 0 else ''}{amount}\n\nТеперь введите:\n\n/adjust USER_ID {amount}")
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "adjust_custom")
-async def admin_adjust_custom(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите команду вручную:\n\n/adjust USER_ID КОЛИЧЕСТВО\n\n(положительное — выдать, отрицательное — снять)")
-    await call.answer()
-
-@router.callback_query(lambda c: c.data == "show_profile")
-async def show_profile(call: CallbackQuery):
-    if not is_private_chat(call.message):
-        await call.answer(MSG_ONLY_IN_PRIVATE_ALERT, show_alert=True)
-        return
-    if not is_admin(call.from_user.id):
-        await call.answer(MSG_ACCESS_DENIED_ALERT, show_alert=True)
-        return
-    await call.message.edit_text("Введите ID пользователя, чтобы посмотреть профиль:\n\nПример: /profile 123456789")
-    await call.answer()
-
-# === ФОНОВАЯ ЗАДАЧА: Напоминание о заявках ===
-async def check_pending_requests():
-    while True:
-        requests = get_pending_requests()
-        if requests:
-            for admin_id in ADMINS:
-                try:
-                    text = "⏰ У вас есть необработанные заявки:\n"
-                    for r in requests:
-                        text += f"ID {r[0]} от {r[3] or r[2]}: {r[4]}\n"
-                    await bot.send_message(admin_id, text)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания админу {admin_id}: {e}")
-        await asyncio.sleep(86400)  # 24 часа
-
-# === ФОНОВАЯ ЗАДАЧА: Начисление процентов в банке ===
-async def bank_interest_task():
-    while True:
-        cursor.execute("SELECT user_id, bank_balance FROM users WHERE bank_balance > 0")
-        users = cursor.fetchall()
-        
-        for user_id, bank_balance in users:
-            interest = int(bank_balance * 0.01)  # 1% в день
-            if interest > 0:
-                update_balance(user_id, interest, "", "", "")
-                cursor.execute("UPDATE users SET bank_balance = bank_balance + ? WHERE user_id = ?", (interest, user_id))
-        
+async def create_promocode_expires(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        import string
+        import secrets
+        days = int(update.message.text)
+        if days < 0:
+            await update.message.reply_text("Дни не могут быть отрицательными. Попробуйте снова.", disable_notification=True)
+            return CREATE_PROMO_EXPIRES
+        code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+        reward = context.user_data['promo_reward']
+        uses = context.user_data['promo_uses']
+        expires_at = (datetime.now() + timedelta(days=days)).isoformat() if days > 0 else None
+        cursor.execute("INSERT INTO promocodes (code, reward, uses_limit, creator_id, expires_at) VALUES (?, ?, ?, ?, ?)",
+                       (code, reward, uses, update.effective_user.id, expires_at))
         conn.commit()
-        await asyncio.sleep(86400)  # 24 часа
+        await update.message.reply_text(f"✅ Промокод '{code}' создан: {reward} восьмерят, лимит {uses if uses != 999999 else 'бесконечный'}, срок {days if days > 0 else 'бессрочный'} дн.", disable_notification=True)
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("Это не число. Попробуйте снова.", disable_notification=True)
+        return CREATE_PROMO_EXPIRES
 
-async def main():
-    dp.include_router(router)
-    
-    # Запуск фоновых задач
-    loop = asyncio.get_event_loop()
-    loop.create_task(check_pending_requests())
-    loop.create_task(bank_interest_task())
-    
-    # Запуск бота
-    await dp.start_polling(bot)
+async def delete_promocode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    await update.message.reply_text("Введите код промокода для удаления:", disable_notification=True)
+    return DELETE_PROMO_CODE
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def delete_promocode_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text
+    cursor.execute("DELETE FROM promocodes WHERE code = ?", (code,))
+    if cursor.rowcount > 0:
+        conn.commit()
+        await update.message.reply_text(f"✅ Промокод '{code}' удалён.", disable_notification=True)
+    else:
+        await update.message.reply_text("❌ Промокод не найден.", disable_notification=True)
+    return ConversationHandler.END
+
+# --- FSM: Магазин ---
+async def add_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    await update.message.reply_text("Введите название товара:", disable_notification=True)
+    return ADD_ITEM_NAME
+
+async def add_item_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text
+    context.user_data['item_name'] = name
+    await update.message.reply_text("Введите цену товара:", disable_notification=True)
+    return ADD_ITEM_PRICE
+
+async def add_item_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text)
+        if price <= 0:
+            await update.message.reply_text("Цена должна быть положительной. Попробуйте снова.", disable_notification=True)
+            return ADD_ITEM_PRICE
+        context.user_data['item_price'] = price
+        await update.message.reply_text("Введите описание товара (или 'нет', если не нужно):", disable_notification=True)
+        return ADD_ITEM_DESC
+    except ValueError:
+        await update.message.reply_text("Это не число. Попробуйте снова.", disable_notification=True)
+        return ADD_ITEM_PRICE
+
+async def add_item_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = update.message.text
+    if desc.lower() == 'нет':
+        desc = None
+    name = context.user_data['item_name']
+    price = context.user_data['item_price']
+    cursor.execute("INSERT INTO shop_items (name, price, description) VALUES (?, ?, ?)", (name, price, desc))
+    conn.commit()
+    await update.message.reply_text(f"✅ Товар '{name}' (цена: {price}) добавлен в магазин.", disable_notification=True)
+    return ConversationHandler.END
+
+async def delete_item_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    await update.message.reply_text("Введите ID товара для удаления:", disable_notification=True)
+    return DELETE_ITEM_ID
+
+async def delete_item_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        item_id = int(update.message.text)
+        cursor.execute("DELETE FROM shop_items WHERE item_id = ?", (item_id,))
+        if cursor.rowcount > 0:
+            conn.commit()
+            await update.message.reply_text(f"✅ Товар с ID {item_id} удалён из магазина.", disable_notification=True)
+        else:
+            await update.message.reply_text("❌ Товар с таким ID не найден.", disable_notification=True)
+    except ValueError:
+        await update.message.reply_text("Это не число. Попробуйте снова.", disable_notification=True)
+        return DELETE_ITEM_ID
+    return ConversationHandler.END
+
+# --- FSM: Выдать/списать ---
+async def admin_adjust_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав администратора.", disable_notification=True)
+        return
+    await update.message.reply_text("Введите: ID_пользователя СУММА (+/-)", disable_notification=True)
+    return ADMIN_ADJUST_INPUT
+
+async def admin_adjust_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        parts = update.message.text.split()
+        target_id = int(parts[0])
+        amount = int(parts[1])
+        target_user = get_user_data(target_id)
+        new_balance = target_user['balance'] + amount
+        update_user_data(target_id, balance=new_balance)
+        action = "начислено" if amount > 0 else "списано"
+        await update.message.reply_text(f"✅ {abs(amount)} восьмерят {action} пользователю {target_id}. Новый баланс: {new_balance}", disable_notification=True)
+        # Уведомить пользователя
+        try:
+            await context.bot.send_message(target_id, f"🔔 Админ {action} {abs(amount)} восьмерят. Новый баланс: {new_balance}", disable_notification=True)
+        except Exception:
+            pass # Не удалось отправить сообщение, например, если бот заблокирован
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат. Введите: ID_пользователя СУММА", disable_notification=True)
+        return ADMIN_ADJUST_INPUT
+    return ConversationHandler.END
+
+# --- КОЛБЭКИ ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "admin_applications":
+        cursor.execute("SELECT app_id, user_id, username, reason FROM applications WHERE status = 'pending'")
+        apps = cursor.fetchall()
+        if apps:
+            apps_list = "\n".join([f"ID: {app[0]}, @{app[2]}, Причина: {app[3]}" for app in apps])
+            await query.edit_message_text(text=f"📋 Новые заявки:\n{apps_list}")
+        else:
+            await query.edit_message_text(text="Нет новых заявок.")
+    elif query.data == "admin_promocodes":
+        cursor.execute("SELECT code, reward, uses_limit, uses_count FROM promocodes")
+        codes = cursor.fetchall()
+        codes_list = "\n".join([f"Код: {c[0]}, Награда: {c[1]}, Использовано: {c[3]}/{c[2] if c[2] != 999999 else '∞'}" for c in codes])
+        await query.edit_message_text(text=f"🏷️ Промокоды:\n{codes_list or 'Нет промокодов.'}")
+    elif query.data == "admin_shop":
+        cursor.execute("SELECT item_id, name, price, description FROM shop_items")
+        items = cursor.fetchall()
+        items_list = "\n".join([f"ID: {item[0]}, {item[1]} - {item[2]} (описание: {item[3] or 'нет'})" for item in items])
+        await query.edit_message_text(text=f"🛍️ Товары в магазине:\n{items_list or 'Нет товаров.'}")
+    elif query.data == "admin_adjust_prompt":
+        await query.edit_message_text(text="Для выдачи/списания используйте команду /adjust ID_пользователя СУММА")
+    elif query.data == "admin_stats":
+        cursor.execute("SELECT COUNT(*), SUM(balance) FROM users")
+        total_users, total_money = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*), SUM(bet) FROM games")
+        total_games, total_bets = cursor.fetchone()
+        await query.edit_message_text(text=f"📊 Статистика:\nВсего пользователей: {total_users}\nВсего восьмерят: {total_money}\nВсего игр: {total_games}\nВсего ставок: {total_bets or 0}")
+    elif query.data == "bank_info":
+        user = get_user_data(query.from_user.id, query.from_user)
+        await query.edit_message_text(text=f"🏦 Информация о банке:\nВаш баланс: {user['balance']}\nВ банке: {user['bank_balance']}\nПроценты: {int(user['bank_balance'] * DAILY_BANK_INTEREST_RATE)} в день")
+
+async def apply_vosemyata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Эта команда доступна только в группе.", disable_notification=True)
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /apply_vosemyata <причина>", disable_notification=True)
+        return
+    reason = ' '.join(args)
+    user = update.effective_user
+    cursor.execute("INSERT INTO applications (user_id, username, first_name, reason) VALUES (?, ?, ?, ?)",
+                   (user.id, user.username, user.first_name, reason))
+    conn.commit()
+    await update.message.reply_text("✅ Ваша заявка подана и будет рассмотрена администратором.", disable_notification=True)
+
+# --- FSM: ConversationHandler для админ-панели ---
+create_promo_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('create_promocode', create_promocode_cmd)],
+    states={
+        CREATE_PROMO_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_promocode_reward)],
+        CREATE_PROMO_USES: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_promocode_uses)],
+        CREATE_PROMO_EXPIRES: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_promocode_expires)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
+delete_promo_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('delete_promocode', delete_promocode_cmd)],
+    states={
+        DELETE_PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_promocode_process)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
+add_item_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('add_item', add_item_cmd)],
+    states={
+        ADD_ITEM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item_name)],
+        ADD_ITEM_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item_price)],
+        ADD_ITEM_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item_desc)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
+delete_item_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('delete_item', delete_item_cmd)],
+    states={
+        DELETE_ITEM_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item_process)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
+adjust_conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('adjust', admin_adjust_cmd)],
+    states={
+        ADMIN_ADJUST_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_adjust_process)],
+    },
+    fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+)
+
+# --- ЗАПУСК БОТА ---
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("dice", dice))
+    application.add_handler(CommandHandler("black_red", black_red))
+    application.add_handler(CommandHandler("ladder", ladder))
+    application.add_handler(CommandHandler("rank", rank))
+    application.add_handler(CommandHandler("work", work))
+    application.add_handler(CommandHandler("work2", work2))
+    application.add_handler(CommandHandler("work3", work3))
+    application.add_handler(CommandHandler("work4", work4))
+    application.add_handler(CommandHandler("weekly", weekly))
+    application.add_handler(CommandHandler("bank", bank))
+    application.add_handler(CommandHandler("deposit", deposit))
+    application.add_handler(CommandHandler("withdraw", withdraw))
+    application.add_handler(CommandHandler("transfer", transfer))
+    application.add_handler(CommandHandler("gift", gift))
+    application.add_handler(CommandHandler("top", top))
+    application.add_handler(CommandHandler("shop", shop))
+    application.add_handler(CommandHandler("buy", buy))
+    application.add_handler(CommandHandler("use_promocode", use_promocode))
+    application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("setskin", setskin))
+    application.add_handler(CommandHandler("setdesc", setdesc))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("feedback", feedback))
+    application.add_handler(CommandHandler("bug_report", bug_report))
+    application.add_handler(CommandHandler("suggest", suggest))
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("apply_vosemyata", apply_vosemyata))
+
+    # FSM handlers
+    application.add_handler(create_promo_conv_handler)
+    application.add_handler(delete_promo_conv_handler)
+    application.add_handler(add_item_conv_handler)
+    application.add_handler(delete_item_conv_handler)
+    application.add_handler(adjust_conv_handler)
+
+    # Callback handler
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    print("Бот запущен...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
